@@ -105,7 +105,7 @@ func (s *stack) seed(n int, handler string) uuid.UUID {
 
 func (s *stack) runner(handlers map[string]worker.Handler, drain time.Duration) (cancel func(), done <-chan error) {
 	ctx, stop := context.WithCancel(s.t.Context())
-	r := worker.NewRunner(worker.NewClient(s.url, nil), handlers, worker.Config{
+	r := worker.NewRunner(worker.NewClient([]string{s.url}, nil), handlers, worker.Config{
 		ID: "w1", Queues: []string{"default"}, Concurrency: 4, DrainTimeout: drain, ClaimWait: 200 * time.Millisecond,
 	}, nil)
 	ch := make(chan error, 1)
