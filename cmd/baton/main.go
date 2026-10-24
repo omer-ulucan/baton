@@ -3,6 +3,7 @@
 // Usage:
 //
 //	baton              run the orchestrator
+//	baton migrate      apply pending database migrations and exit
 //	baton healthcheck  probe the local /healthz (for container health checks)
 package main
 
@@ -22,6 +23,7 @@ import (
 
 	"github.com/omer-ulucan/baton/internal/config"
 	"github.com/omer-ulucan/baton/internal/server"
+	"github.com/omer-ulucan/baton/internal/store"
 )
 
 func main() {
@@ -34,7 +36,12 @@ func main() {
 		return
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	err := run(ctx, log)
+	var err error
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		err = migrate()
+	} else {
+		err = run(ctx, log)
+	}
 	stop()
 	if err != nil {
 		log.Error("baton exited", "err", err)
@@ -49,6 +56,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("config: %w", err)
 	}
 	log = log.With("replica", cfg.ReplicaID)
+
+	if cfg.AutoMigrate {
+		if err := store.Migrate(cfg.DatabaseURL); err != nil {
+			return err
+		}
+		log.Info("database migrated")
+	}
 
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -83,6 +97,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+func migrate() error {
+	hostname, _ := os.Hostname()
+	cfg, err := config.LoadOrchestrator(os.Getenv, hostname)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	return store.Migrate(cfg.DatabaseURL)
 }
 
 func healthcheck(addr string) error {
