@@ -32,40 +32,39 @@ type LeaderInfo struct {
 // leader_lease, so it never waits for in-flight writes. ok is false when
 // another replica holds a live lease.
 func (s *Store) AcquireLeadership(ctx context.Context, holder, addr string, ttl time.Duration) (token int64, ok bool, err error) {
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var renewal bool
-		err := tx.QueryRow(ctx, `
-			WITH prev AS (
-				SELECT holder_id = $1 AND expires_at > clock_timestamp() AS renewal
-				  FROM leader_lease
-				 WHERE name = 'leader' AND (holder_id = $1 OR expires_at <= clock_timestamp())
-				   FOR UPDATE
-			)
+	// One statement, so a renewal costs one round trip: under database
+	// latency a multi-statement transaction can outlast the renewal
+	// deadline and make a healthy leader step down. The fence row is only
+	// updated for a new term; that UPDATE still waits for the previous
+	// leader's in-flight transactions (they hold the fence FOR SHARE).
+	var renewal bool
+	err = s.pool.QueryRow(ctx, `
+		WITH prev AS (
+			SELECT holder_id = $1 AND expires_at > clock_timestamp() AS renewal
+			  FROM leader_lease
+			 WHERE name = 'leader' AND (holder_id = $1 OR expires_at <= clock_timestamp())
+			   FOR UPDATE
+		), upd AS (
 			UPDATE leader_lease l
 			   SET holder_id = $1, holder_addr = $2, expires_at = clock_timestamp() + $3 * interval '1 microsecond'
 			  FROM prev
 			 WHERE l.name = 'leader'
-			RETURNING prev.renewal`, holder, addr, ttl.Microseconds()).Scan(&renewal)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		ok = true
-		if renewal {
-			return tx.QueryRow(ctx, `SELECT fencing_token FROM leader_fence WHERE name = 'leader'`).Scan(&token)
-		}
-		// A new term: bumping the token waits for the previous leader's
-		// in-flight transactions (they hold the fence FOR SHARE) and
-		// fences everything after them.
-		return tx.QueryRow(ctx, `UPDATE leader_fence SET fencing_token = fencing_token + 1
-			WHERE name = 'leader' RETURNING fencing_token`).Scan(&token)
-	})
+			RETURNING prev.renewal
+		), bump AS (
+			UPDATE leader_fence SET fencing_token = fencing_token + 1
+			 WHERE name = 'leader' AND EXISTS (SELECT 1 FROM upd WHERE NOT upd.renewal)
+			RETURNING fencing_token
+		)
+		SELECT upd.renewal,
+		       COALESCE((SELECT fencing_token FROM bump), (SELECT fencing_token FROM leader_fence WHERE name = 'leader'))
+		  FROM upd`, holder, addr, ttl.Microseconds()).Scan(&renewal, &token)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
 	if err != nil {
 		return 0, false, fmt.Errorf("acquire leadership: %w", err)
 	}
-	return token, ok, nil
+	return token, true, nil
 }
 
 // ReleaseLeadership gives up the lease if holder still has it in the
@@ -109,12 +108,14 @@ func (s *Store) Leader(ctx context.Context) (LeaderInfo, error) {
 func (t *Tx) checkFence(ctx context.Context) error {
 	var token int64
 	var live bool
-	err := t.tx.QueryRow(ctx, `SELECT f.fencing_token, l.expires_at > clock_timestamp()
+	// Reads the clock too, saving the transaction a round trip.
+	err := t.tx.QueryRow(ctx, `SELECT clock_timestamp(), f.fencing_token, l.expires_at > clock_timestamp()
 		FROM leader_fence f, leader_lease l WHERE f.name = 'leader' AND l.name = 'leader'
-		FOR SHARE OF f`).Scan(&token, &live)
+		FOR SHARE OF f`).Scan(&t.now, &token, &live)
 	if err != nil {
 		return fmt.Errorf("check fence: %w", err)
 	}
+	t.now = t.now.UTC()
 	if token != t.fence.Token || !live {
 		return fmt.Errorf("%w (token %d, current %d, live %t)", ErrFenced, t.fence.Token, token, live)
 	}
