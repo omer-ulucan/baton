@@ -111,11 +111,43 @@ func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment,
 		if _, err := tx.TouchWorker(ctx, req.WorkerID); err != nil {
 			return err
 		}
-		refs, err := tx.ClaimCandidates(ctx, queues, handlers, req.Max)
+		// Per-queue limits (SPEC 9.1): lock the limited queues in sorted
+		// order, count what runs, then fill claims best-first while each
+		// queue has room and rate tokens.
+		cfgs, err := tx.QueueConfigs(ctx)
 		if err != nil {
 			return err
 		}
-		for _, ref := range refs {
+		lq := limited(cfgs, queues, hasClaimLimit)
+		if err := tx.LockQueues(ctx, lq); err != nil {
+			return err
+		}
+		running, err := tx.RunningCounts(ctx, lq)
+		if err != nil {
+			return err
+		}
+		fetch := req.Max
+		if len(lq) > 0 {
+			fetch = min(req.Max*4, 128) // look past full queues
+		}
+		cands, err := tx.ClaimCandidates(ctx, queues, handlers, fetch, e.cfg.AgingSeconds)
+		if err != nil {
+			return err
+		}
+		for _, cand := range cands {
+			if len(out) == req.Max {
+				break
+			}
+			if c, ok := cfgs[cand.Queue]; ok {
+				if c.MaxConcurrency != nil && running[cand.Queue] >= *c.MaxConcurrency {
+					continue
+				}
+				if c.RatePerSec != nil && !e.rates.take(cand.Queue, *c.RatePerSec, burstOf(c), tx.Now()) {
+					continue
+				}
+			}
+			running[cand.Queue]++
+			ref := cand.TaskRef
 			snap, err := tx.Load(ctx, ref.WorkflowID)
 			if err != nil {
 				return err

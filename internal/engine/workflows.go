@@ -104,6 +104,28 @@ func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) 
 				changes = append(changes, state.Change{TaskID: id, Payload: decisionEvent(decision.KindPriority, cl.d, nil, cl.latency)})
 			}
 		}
+		// Admission control (SPEC 9.3), with the queues locked so racing
+		// submissions cannot both squeeze in.
+		cfgs, err := tx.QueueConfigs(ctx)
+		if err != nil {
+			return err
+		}
+		adding := queueCounts(&def)
+		qs := limited(cfgs, keys(adding), hasDepthLimit)
+		if err := tx.LockQueues(ctx, qs); err != nil {
+			return err
+		}
+		depths, err := tx.Depths(ctx, qs)
+		if err != nil {
+			return err
+		}
+		deferIt, err := admission(cfgs, depths, adding)
+		if err != nil {
+			return err
+		}
+		if deferIt {
+			changes = append(changes, state.Change{Payload: state.WorkflowDeferred{}})
+		}
 		snap := state.NewSnapshot()
 		e.defs.put(defID, &def)
 		if err := e.commit(ctx, tx, snap, wfID, changes); err != nil {

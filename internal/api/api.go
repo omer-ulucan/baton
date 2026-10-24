@@ -117,3 +117,25 @@ type DLQList struct {
 	Entries    []DLQEntry `json:"entries"`
 	NextCursor string     `json:"next_cursor,omitempty"`
 }
+
+type QueueConfig struct {
+	MaxConcurrency *int     `json:"max_concurrency,omitempty"`
+	RatePerSec     *float64 `json:"rate_per_sec,omitempty"`
+	Burst          *int     `json:"burst,omitempty"`
+	MaxDepth       *int     `json:"max_depth,omitempty"`
+	AdmissionMode  string   `json:"admission_mode,omitempty"` // reject | defer
+}
+
+type Queue struct {
+	Queue        string      `json:"queue"`
+	Pending      int         `json:"pending"`
+	Ready        int         `json:"ready"`
+	Running      int         `json:"running"`
+	RetryWait    int         `json:"retry_wait"`
+	DeadLettered int         `json:"dead_lettered"`
+	Config       QueueConfig `json:"config"`
+}
+
+type QueueList struct {
+	Queues []Queue `json:"queues"`
+}
