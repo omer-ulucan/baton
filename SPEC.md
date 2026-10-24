@@ -650,30 +650,43 @@ SIGINT releases immediately.
 
 ### 9.1 Per-queue limits (enforced at claim)
 
-- **Concurrency:** count of `running` tasks in the queue, read under a
-  per-queue advisory transaction lock (`pg_advisory_xact_lock(hashtext(queue))`)
-  so concurrent claims cannot overshoot `max_concurrency`.
+Settings live in `queue_config` (`PUT /v1/queues/{queue}`); a queue without
+a row is unlimited.
+
+- **Concurrency:** a claim locks every limited queue the worker serves with
+  `pg_advisory_xact_lock`, in sorted queue order (so overlapping claims
+  cannot deadlock), counts their running tasks, and then fills its claims
+  best-first, skipping candidates whose queue is full. It looks past full
+  queues by fetching up to `4 × max` candidates. Concurrent claims cannot
+  overshoot `max_concurrency`.
 - **Rate:** token bucket per queue held in leader memory (`rate_per_sec`,
-  `burst`). Leader-only, so a single bucket exists; it resets on failover,
-  which can briefly allow up to one extra burst. Documented limitation.
+  `burst`, default burst 1), one token per claimed task. Leader-only, so a
+  single bucket exists; it resets on failover, which can briefly allow up to
+  one extra burst. Documented limitation.
 
 ### 9.2 Priority with aging
 
-`effective_priority = priority + floor(extract(epoch from now() - ready_at) / BATON_AGING_SECONDS)`,
-capped at 200. Default `BATON_AGING_SECONDS = 30`: a priority-0 task outranks
-a fresh priority-100 task after 50 minutes at most. Ties: oldest `ready_at`,
-then `id`.
+`effective_priority = priority + floor((now - ready_at) / BATON_AGING_SECONDS)`,
+capped at 200, computed in the claim query on the database clock. Default
+`BATON_AGING_SECONDS = 30`: a priority-0 task outranks a fresh priority-100
+task after 50 minutes at most. Ties: oldest `ready_at`, then `id`. A released
+task keeps its `ready_at`, so it keeps its aging.
 
 ### 9.3 Admission control
 
-On submission, the leader computes the depth of each queue the workflow
-touches (`ready + retry_wait + pending` tasks). If any exceeds
-`queue_config.max_depth`:
-- `admission_mode = reject`: `429 queue_full` with `Retry-After`.
-- `admission_mode = defer`: workflow is recorded as `deferred` (`202`), and
-  the scheduler admits deferred workflows FIFO as depth falls.
+On submission, with the workflow's depth-limited queues locked in the same
+sorted order, the leader computes each queue's depth: `pending`, `ready`
+and `retry_wait` tasks of workflows that are not `deferred`. If depth plus
+the new workflow's tasks in that queue exceeds `max_depth`:
+- `admission_mode = reject`: `429 queue_full` with `Retry-After` and
+  `details: {queue, depth, max_depth}`; nothing is written.
+- `admission_mode = defer`: the workflow is recorded as `deferred` (`202`).
+  Every second the leader admits deferred workflows oldest first whose
+  queues now have room; a younger workflow on other queues may be admitted
+  before an older one that still does not fit.
 
----
+If any queue of the workflow rejects, the submission is rejected even if
+other queues would defer it.
 
 ## 10. Decision layer contract
 
