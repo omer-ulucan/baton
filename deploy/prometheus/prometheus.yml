@@ -2,7 +2,6 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
-  # /metrics is served from phase 9; until then these targets report down.
   - job_name: baton
     static_configs:
       - targets: ["baton-1:8080", "baton-2:8080"]

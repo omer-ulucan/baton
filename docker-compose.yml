@@ -1,4 +1,5 @@
-# Local stack: Postgres, 2 orchestrators, 3 workers, Toxiproxy, Prometheus, Grafana.
+# Local stack: Postgres, 2 orchestrators, 3 workers, Toxiproxy, Prometheus,
+# Grafana and Jaeger (traces over OTLP).
 # The orchestrators reach Postgres through Toxiproxy so the chaos suite can
 # inject latency and partitions (SPEC 6.5). Credentials are local-dev only.
 
@@ -22,6 +23,7 @@ x-baton: &baton
 x-baton-env: &baton-env
   BATON_DATABASE_URL: postgres://baton:baton@toxiproxy:15432/baton?sslmode=disable
   BATON_HTTP_ADDR: ":8080"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
 
 services:
   postgres:
@@ -74,9 +76,14 @@ services:
     environment:
       BATON_ADDR: http://baton-2:8080,http://baton-1:8080
       BATON_WORKER_QUEUES: default
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       baton-1:
         condition: service_healthy
+
+  jaeger:
+    image: jaegertracing/jaeger:2.11.0
+    ports: ["16686:16686"]   # UI; OTLP/HTTP on 4318 inside the network
 
   prometheus:
     image: prom/prometheus:v3.5.0
@@ -92,7 +99,7 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
-    depends_on: [prometheus]
+    depends_on: [prometheus, jaeger]
 
 volumes:
   pgdata:
