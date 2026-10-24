@@ -18,3 +18,4 @@ Format: Status, Context, Decision, Consequences, Alternatives considered.
 | [0009](0009-decision-layer-fallback.md) | Decision layer: policy interface, bounded inference, fallback, recorded decisions | Accepted |
 | [0010](0010-yaml-dag-and-saga.md) | YAML DAG workflows with sequential saga compensation | Accepted |
 | [0011](0011-backpressure-priority-aging.md) | Backpressure: claim-time limits, priority aging, admission control | Accepted |
+| [0012](0012-pure-go-tokenizer.md) | A pure-Go tokenizer for Laya, verified against Hugging Face | Accepted |
