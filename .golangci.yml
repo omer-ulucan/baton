@@ -2,6 +2,8 @@ version: "2"
 
 run:
   timeout: 5m
+  # Lint the chaos suite too; it only builds with this tag.
+  build-tags: [chaos]
 
 linters:
   default: standard

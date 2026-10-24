@@ -2,7 +2,7 @@ GOLANGCI_LINT_VERSION := v2.15.0
 BIN := $(CURDIR)/bin
 GOLANGCI_LINT := $(BIN)/golangci-lint
 
-.PHONY: all build vet test test-race lint check tools up down
+.PHONY: all build vet test test-race lint check chaos tools up down
 
 all: check
 
@@ -20,6 +20,10 @@ test-race:
 
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run ./...
+
+# Fault injection: kill -9, failover, partitions, latency, model faults.
+chaos:
+	scripts/chaos.sh
 
 # What must pass before every commit.
 check: vet lint test-race
