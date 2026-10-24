@@ -164,17 +164,22 @@ func isUniqueViolation(err error) bool {
 // so their next heartbeat stops them. With compensate, completed steps are
 // compensated first (SPEC 3.3).
 func (e *Engine) Cancel(ctx context.Context, wfID uuid.UUID, compensate bool, reason string) error {
-	if compensate {
-		return fmt.Errorf("%w: cancel with compensation is not supported yet", ErrInvalid)
-	}
 	return e.updateWorkflow(ctx, wfID, func(snap *state.Snapshot) ([]state.Change, error) {
-		changes := []state.Change{{Payload: state.WorkflowCancelRequested{Compensate: compensate, Reason: clean(reason)}}}
-		for _, t := range stepTasks(snap, nil) {
+		def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+		if err != nil {
+			return nil, err
+		}
+		sb := newSandbox(snap, wfID)
+		sb.add(uuid.Nil, state.WorkflowCancelRequested{Compensate: compensate, Reason: clean(reason)})
+		for _, t := range stepTasks(sb.s, nil) {
 			if !t.Status.Terminal() {
-				changes = append(changes, state.Change{TaskID: t.ID, Payload: state.TaskCancelled{}})
+				sb.add(t.ID, state.TaskCancelled{})
 			}
 		}
-		return append(changes, state.Change{Payload: state.WorkflowCancelled{}}), nil
+		if !compensate || !startCompensation(sb, def) {
+			sb.add(uuid.Nil, state.WorkflowCancelled{})
+		}
+		return sb.changes, sb.err
 	})
 }
 

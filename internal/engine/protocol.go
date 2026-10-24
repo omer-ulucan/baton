@@ -322,7 +322,7 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 			sb := newSandbox(snap, wf)
 			sb.addAll(changes)
 			if snap.Workflow.Status == state.WfRunning || snap.Workflow.Status == state.WfPaused {
-				failWorkflow(sb, t.ID)
+				failWorkflow(sb, def, t.ID)
 			}
 			if sb.err != nil {
 				return sb.err
