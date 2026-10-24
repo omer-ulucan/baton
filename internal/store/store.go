@@ -60,11 +60,7 @@ func (s *Store) InTx(ctx context.Context, fence Fence, fn func(*Tx) error) error
 	t := &Tx{fence: fence}
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		t.tx, t.afterCommit = tx, nil
-		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&t.now); err != nil {
-			return fmt.Errorf("read clock: %w", err)
-		}
-		t.now = t.now.UTC()
-		if err := t.checkFence(ctx); err != nil {
+		if err := t.checkFence(ctx); err != nil { // also reads the database clock
 			return err
 		}
 		return fn(t)
