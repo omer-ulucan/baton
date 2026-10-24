@@ -1,0 +1,26 @@
+# Laya decision layer for the local stack:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.laya.yml up -d
+#
+# Both orchestrators share one model volume. On first start they fetch the
+# pinned fp32 model (1.7GB) into it and verify every file before loading;
+# until then, and if anything fails, decisions use the rule policy. Each
+# replica holds the model in memory (about 2GB), so this needs roughly 4GB
+# of free RAM on top of the rest of the stack.
+
+x-laya-env: &laya-env
+  BATON_DECISION_POLICY: laya
+  BATON_MODEL_DIR: /var/lib/baton/models
+
+services:
+  baton-1:
+    environment:
+      <<: *laya-env
+    volumes: [models:/var/lib/baton/models]
+  baton-2:
+    environment:
+      <<: *laya-env
+    volumes: [models:/var/lib/baton/models]
+
+volumes:
+  models:
