@@ -1,0 +1,508 @@
+openapi: 3.1.0
+info:
+  title: Baton
+  version: "1"
+  description: |
+    Distributed task orchestrator. The public API submits and controls
+    workflows; the worker protocol is used by baton-worker processes.
+
+    Any replica accepts any request: followers serve reads themselves and
+    forward writes to the leader. Every endpoint accepts and propagates a
+    W3C `traceparent` header. Errors use the `Error` envelope.
+servers:
+  - url: http://localhost:8081
+tags:
+  - name: workflows
+  - name: dlq
+  - name: worker
+  - name: ops
+
+paths:
+  /v1/workflows:
+    post:
+      tags: [workflows]
+      summary: Submit a workflow
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Repeating a submission with the same key returns the original workflow (200).
+          schema: { type: string, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitRequest" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/SubmitResponse" } } } }
+        "200": { description: Existing workflow for this Idempotency-Key, content: { application/json: { schema: { $ref: "#/components/schemas/SubmitResponse" } } } }
+        "202": { description: Accepted but deferred by admission control, content: { application/json: { schema: { $ref: "#/components/schemas/SubmitResponse" } } } }
+        "422": { $ref: "#/components/responses/InvalidDefinition" }
+        "429": { $ref: "#/components/responses/QueueFull" }
+    get:
+      tags: [workflows]
+      summary: List workflows (keyset-paginated, oldest first)
+      parameters:
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/WorkflowStatus" } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/WorkflowList" } } } }
+
+  /v1/workflows/{id}:
+    get:
+      tags: [workflows]
+      summary: Workflow status with its tasks
+      parameters: [{ $ref: "#/components/parameters/WorkflowID" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Workflow" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workflows/{id}/events:
+    get:
+      tags: [workflows]
+      summary: Event history
+      parameters:
+        - { $ref: "#/components/parameters/WorkflowID" }
+        - { name: after_seq, in: query, schema: { type: integer, minimum: 0 } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/EventList" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workflows/{id}/cancel:
+    post:
+      tags: [workflows]
+      summary: Cancel a workflow
+      description: |
+        Cancels every queued and running task and revokes running leases;
+        workers stop at their next heartbeat. With `compensate`, completed
+        steps are compensated first and the workflow then ends `cancelled`.
+      parameters: [{ $ref: "#/components/parameters/WorkflowID" }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/workflows/{id}/pause:
+    post:
+      tags: [workflows]
+      summary: Pause (no new claims; running attempts finish)
+      parameters: [{ $ref: "#/components/parameters/WorkflowID" }]
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/workflows/{id}/resume:
+    post:
+      tags: [workflows]
+      summary: Resume a paused workflow
+      parameters: [{ $ref: "#/components/parameters/WorkflowID" }]
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/dlq:
+    get:
+      tags: [dlq]
+      summary: Dead-lettered tasks with their last error and decision
+      parameters:
+        - { name: queue, in: query, schema: { type: string } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/DLQList" } } } }
+
+  /v1/dlq/{task_id}/retry:
+    post:
+      tags: [dlq]
+      summary: Requeue a dead-lettered task with a fresh attempt budget
+      description: If its workflow had failed, the workflow runs again.
+      parameters:
+        - { name: task_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Baton-Actor, in: header, required: false, description: Recorded as who requeued the task., schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/worker/register:
+    post:
+      tags: [worker]
+      summary: Register a worker and its capabilities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, queues, handlers]
+              additionalProperties: false
+              properties:
+                worker_id: { type: string }
+                queues: { type: array, items: { type: string }, minItems: 1 }
+                handlers: { type: array, items: { type: string }, minItems: 1 }
+                version: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  heartbeat_interval_ms: { type: integer }
+                  lease_ttl_ms: { type: integer }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+
+  /v1/worker/claim:
+    post:
+      tags: [worker]
+      summary: Claim ready tasks (long-poll up to wait_ms)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id]
+              additionalProperties: false
+              properties:
+                worker_id: { type: string }
+                queues: { type: array, items: { type: string }, description: "Subset of the registered queues; empty means all." }
+                max: { type: integer, minimum: 0, maximum: 32 }
+                wait_ms: { type: integer, minimum: 0, maximum: 30000 }
+      responses:
+        "200":
+          description: Claimed tasks (possibly none)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks: { type: array, items: { $ref: "#/components/schemas/Assignment" } }
+        "404": { $ref: "#/components/responses/UnknownWorker" }
+
+  /v1/worker/heartbeat:
+    post:
+      tags: [worker]
+      summary: Extend leases of in-flight attempts
+      description: Attempts that cannot be extended are returned in `revoked`; the worker must abandon them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, attempts]
+              additionalProperties: false
+              properties:
+                worker_id: { type: string }
+                attempts: { type: array, items: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  extended:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        attempt_id: { type: string, format: uuid }
+                        lease_until: { type: string, format: date-time }
+                  revoked:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        attempt_id: { type: string, format: uuid }
+                        reason: { type: string, enum: [cancelled, superseded, expired] }
+        "404": { $ref: "#/components/responses/UnknownWorker" }
+
+  /v1/worker/complete:
+    post:
+      tags: [worker]
+      summary: Report a successful attempt
+      description: Accepted only from the holder of the current attempt's live lease; repeating an accepted report is a no-op.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, task_id, attempt_id]
+              additionalProperties: false
+              properties:
+                worker_id: { type: string }
+                task_id: { type: string, format: uuid }
+                attempt_id: { type: string, format: uuid }
+                output: { type: object }
+      responses:
+        "200": { description: Recorded }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/AttemptConflict" }
+
+  /v1/worker/fail:
+    post:
+      tags: [worker]
+      summary: Report a failed attempt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, task_id, attempt_id, error]
+              additionalProperties: false
+              properties:
+                worker_id: { type: string }
+                task_id: { type: string, format: uuid }
+                attempt_id: { type: string, format: uuid }
+                error:
+                  type: object
+                  required: [message]
+                  properties:
+                    message: { type: string }
+                    type: { type: string }
+                    stack: { type: string }
+                    retryable: { type: boolean, description: "Worker's hint; false asks not to retry." }
+      responses:
+        "200":
+          description: Recorded and triaged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next: { type: string, enum: [retry, dead_letter] }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/AttemptConflict" }
+
+  /v1/worker/release:
+    post:
+      tags: [worker]
+      summary: Hand unfinished attempts back without consuming them (shutdown)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, attempt_ids]
+              additionalProperties: false
+              properties:
+                worker_id: { type: string }
+                attempt_ids: { type: array, items: { type: string, format: uuid } }
+      responses:
+        "200": { description: Released }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness (never touches the database)
+      responses:
+        "200": { description: Alive }
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness (database reachable)
+      responses:
+        "200": { description: Ready }
+        "503": { description: Not ready }
+
+components:
+  parameters:
+    WorkflowID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` of the previous page.
+      schema: { type: string, format: uuid }
+
+  responses:
+    Status:
+      description: OK
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              status: { type: string }
+    NotFound:
+      description: Not found
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    InvalidRequest:
+      description: Malformed or out-of-range request (code invalid_request)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    InvalidDefinition:
+      description: |
+        Invalid definition or submission (code invalid_definition). Every
+        problem is listed in error.details.problems.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    InvalidTransition:
+      description: Not allowed in the current state (code invalid_transition)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    QueueFull:
+      description: Admission control rejected the submission (code queue_full); see Retry-After.
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnknownWorker:
+      description: Worker not registered (code unknown_worker); re-register.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    AttemptConflict:
+      description: |
+        The attempt is no longer current. Codes: attempt_superseded,
+        cancelled (workflow cancelled), lease_expired.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: object }
+
+    WorkflowStatus:
+      type: string
+      enum: [running, deferred, paused, succeeded, failed, compensating, compensated, compensation_failed, cancelled]
+
+    TaskStatus:
+      type: string
+      enum: [pending, ready, running, retry_wait, succeeded, dead_lettered, cancelled, skipped]
+
+    SubmitRequest:
+      type: object
+      required: [definition]
+      additionalProperties: false
+      properties:
+        definition: { type: string, description: Workflow definition YAML (SPEC 2). }
+        input: { type: object, description: Workflow input; each step receives it with the step's own input merged over it. }
+        priority: { type: integer, minimum: 0, maximum: 100 }
+        callback_url: { type: string, format: uri, description: Receives a workflow.terminal webhook via the outbox. }
+
+    SubmitResponse:
+      type: object
+      properties:
+        workflow_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/WorkflowStatus" }
+        existing: { type: boolean }
+
+    CancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        compensate: { type: boolean, default: false }
+        reason: { type: string }
+
+    Workflow:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        definition_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/WorkflowStatus" }
+        priority: { type: integer }
+        cancel_requested: { type: boolean }
+        last_seq: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        tasks: { type: array, items: { $ref: "#/components/schemas/Task" } }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        step: { type: string }
+        kind: { type: string, enum: [step, compensation] }
+        handler: { type: string }
+        queue: { type: string }
+        priority: { type: integer }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        attempt: { type: integer }
+        max_attempts: { type: integer }
+        worker_id: { type: string }
+        run_at: { type: string, format: date-time }
+        last_error: { type: string }
+        updated_at: { type: string, format: date-time }
+
+    WorkflowList:
+      type: object
+      properties:
+        workflows: { type: array, items: { $ref: "#/components/schemas/Workflow" } }
+        next_cursor: { type: string }
+
+    EventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            type: object
+            properties:
+              seq: { type: integer }
+              type: { type: string }
+              task_id: { type: string, format: uuid }
+              occurred_at: { type: string, format: date-time }
+              payload: { type: object }
+
+    DLQList:
+      type: object
+      properties:
+        next_cursor: { type: string }
+        entries:
+          type: array
+          items:
+            type: object
+            properties:
+              task: { $ref: "#/components/schemas/Task" }
+              workflow_id: { type: string, format: uuid }
+              dead_lettered_at: { type: string, format: date-time }
+              last_decision:
+                type: object
+                properties:
+                  label: { type: string }
+                  confidence: { type: number }
+                  policy: { type: string }
+                  fallback: { type: string }
+
+    Assignment:
+      type: object
+      properties:
+        task_id: { type: string, format: uuid }
+        attempt_id: { type: string, format: uuid }
+        workflow_id: { type: string, format: uuid }
+        step: { type: string }
+        kind: { type: string }
+        handler: { type: string }
+        queue: { type: string }
+        input: { type: object }
+        idempotency_key: { type: string, description: Stable across attempts; see docs/IDEMPOTENCY.md. }
+        attempt: { type: integer }
+        max_attempts: { type: integer }
+        deadline: { type: string, format: date-time }
+        lease_until: { type: string, format: date-time }
