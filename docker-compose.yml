@@ -72,7 +72,7 @@ services:
       replicas: 3
     stop_grace_period: 30s
     environment:
-      BATON_ADDR: http://baton-1:8080
+      BATON_ADDR: http://baton-2:8080,http://baton-1:8080
       BATON_WORKER_QUEUES: default
     depends_on:
       baton-1:
