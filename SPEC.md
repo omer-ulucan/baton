@@ -695,7 +695,8 @@ type Decision struct {
     Fallback      string  // "" | "low_confidence" | "timeout" | "error" | "unavailable"
 }
 
-type DecisionPolicy interface {
+// decision.Policy; called DecisionPolicy elsewhere in this document.
+type Policy interface {
     Decide(ctx context.Context, req Request) (Decision, error)
 }
 ```
