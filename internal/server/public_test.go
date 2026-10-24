@@ -49,7 +49,8 @@ func newAPI(t *testing.T) *client {
 	t.Helper()
 	pool, _ := pg.NewDB(t)
 	st := store.New(pool)
-	eng := engine.New(engine.Options{Store: st})
+	fence := pgtest.Lead(t, pool)
+	eng := engine.New(engine.Options{Store: st, Fence: func() store.Fence { return fence }})
 	srv := httptest.NewServer(server.New(server.Deps{DB: pool, Worker: eng, Commands: eng, Reader: st}))
 	t.Cleanup(srv.Close)
 	return &client{t: t, url: srv.URL, eng: eng}

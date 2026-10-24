@@ -18,6 +18,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/omer-ulucan/baton/internal/store"
 )
 
 const (
@@ -105,4 +107,15 @@ func (s *Server) exec(ctx context.Context, sql string) error {
 	defer conn.Close(ctx)
 	_, err = conn.Exec(ctx, sql)
 	return err
+}
+
+// Lead makes the test the leader of its database for an hour and returns
+// the fence that write transactions must carry.
+func Lead(t *testing.T, pool *pgxpool.Pool) store.Fence {
+	t.Helper()
+	token, ok, err := store.New(pool).AcquireLeadership(t.Context(), "test-leader", "", time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("acquire leadership: ok=%t err=%v", ok, err)
+	}
+	return store.Fence{Token: token}
 }

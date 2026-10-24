@@ -9,16 +9,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/omer-ulucan/baton/internal/pgtest"
 	"github.com/omer-ulucan/baton/internal/state"
 	"github.com/omer-ulucan/baton/internal/state/statetest"
 	"github.com/omer-ulucan/baton/internal/store"
 )
 
+// fence is the token pgtest.Lead returns on a fresh database.
 var fence = store.Fence{Token: 1}
 
 func newStore(t *testing.T) (*store.Store, *pgxpool.Pool) {
 	t.Helper()
 	pool, _ := pg.NewDB(t)
+	if f := pgtest.Lead(t, pool); f != fence {
+		t.Fatalf("fence = %v, want %v", f, fence)
+	}
 	_, err := pool.Exec(t.Context(), `INSERT INTO workflow_definitions (id, name, version, sha256, spec, created_at)
 		VALUES ($1, 'test', 1, '\x00', '{}', now())`, statetest.DefinitionID)
 	if err != nil {

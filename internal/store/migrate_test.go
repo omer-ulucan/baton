@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/omer-ulucan/baton/internal/pgtest"
 	"github.com/omer-ulucan/baton/internal/store"
 )
 
@@ -39,6 +40,7 @@ func TestMigrateDownAndUpAgain(t *testing.T) {
 func TestEventsAreAppendOnly(t *testing.T) {
 	pool, _ := pg.NewDB(t)
 	ctx := t.Context()
+	pgtest.Lead(t, pool)
 	_, err := pool.Exec(ctx, `INSERT INTO workflow_events
 		(workflow_id, seq, type, payload, occurred_at, fencing_token)
 		VALUES (gen_random_uuid(), 1, 'WorkflowSubmitted', '{}', now(), 1)`)

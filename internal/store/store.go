@@ -21,8 +21,9 @@ type Store struct {
 // New returns a Store over pool.
 func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-// Fence identifies the writer. Its token is stored on every event; from
-// phase 5 a trigger rejects tokens that are not the current leader's.
+// Fence identifies the writer by the fencing token of its leader lease.
+// Every write transaction verifies it (checkFence) and every event carries
+// it, where a trigger rejects it unless it is current (SPEC 6.2).
 type Fence struct {
 	Token int64
 }
@@ -52,7 +53,9 @@ func (t *Tx) AfterCommit(fn func()) { t.afterCommit = append(t.afterCommit, fn) 
 // and lease decision in the transaction uses it.
 func (t *Tx) Now() time.Time { return t.now }
 
-// InTx runs fn in a transaction, committing if it returns nil.
+// InTx runs fn in a transaction, committing if it returns nil. The
+// transaction first verifies fence; a stale or expired writer gets
+// ErrFenced and nothing is written.
 func (s *Store) InTx(ctx context.Context, fence Fence, fn func(*Tx) error) error {
 	t := &Tx{fence: fence}
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -61,10 +64,13 @@ func (s *Store) InTx(ctx context.Context, fence Fence, fn func(*Tx) error) error
 			return fmt.Errorf("read clock: %w", err)
 		}
 		t.now = t.now.UTC()
+		if err := t.checkFence(ctx); err != nil {
+			return err
+		}
 		return fn(t)
 	})
 	if err != nil {
-		return err
+		return fencedErr(err)
 	}
 	for _, f := range t.afterCommit {
 		f()

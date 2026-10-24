@@ -42,6 +42,7 @@ func TestMain(m *testing.M) {
 var defID = uuid.MustParse("00000000-0000-7000-8000-0000000000aa")
 
 type env struct {
+	fence store.Fence
 	t     *testing.T
 	pool  *pgxpool.Pool
 	store *store.Store
@@ -60,11 +61,12 @@ func newEnv(t *testing.T, mod func(*engine.Options)) *env {
 		t.Fatal(err)
 	}
 	s := store.New(pool)
-	o := engine.Options{Store: s, RetryPolicy: fastRetry, Config: engine.Config{ClaimPoll: 20 * time.Millisecond}}
+	fence := pgtest.Lead(t, pool)
+	o := engine.Options{Store: s, Fence: func() store.Fence { return fence }, RetryPolicy: fastRetry, Config: engine.Config{ClaimPoll: 20 * time.Millisecond}}
 	if mod != nil {
 		mod(&o)
 	}
-	return &env{t: t, pool: pool, store: s, eng: engine.New(o)}
+	return &env{fence: fence, t: t, pool: pool, store: s, eng: engine.New(o)}
 }
 
 // seed creates a running workflow with n ready tasks.
@@ -84,7 +86,7 @@ func (e *env) seed(n int, queue, handler string, maxAttempts int) (uuid.UUID, []
 	for _, id := range ids {
 		changes = append(changes, state.Change{TaskID: id, Payload: state.TaskReady{}})
 	}
-	if _, _, err := e.store.Update(e.t.Context(), store.Fence{}, wf, func(*state.Snapshot, time.Time) ([]state.Change, error) {
+	if _, _, err := e.store.Update(e.t.Context(), e.fence, wf, func(*state.Snapshot, time.Time) ([]state.Change, error) {
 		return changes, nil
 	}); err != nil {
 		e.t.Fatal(err)
@@ -199,7 +201,7 @@ func TestClaimFilters(t *testing.T) {
 func TestClaimOrderAndPausedWorkflows(t *testing.T) {
 	e := newEnv(t, nil)
 	paused, _ := e.seed(1, "q", "h", 1)
-	if _, _, err := e.store.Update(t.Context(), store.Fence{}, paused, func(*state.Snapshot, time.Time) ([]state.Change, error) {
+	if _, _, err := e.store.Update(t.Context(), e.fence, paused, func(*state.Snapshot, time.Time) ([]state.Change, error) {
 		return []state.Change{{Payload: state.WorkflowPaused{}}}, nil
 	}); err != nil {
 		t.Fatal(err)

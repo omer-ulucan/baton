@@ -46,6 +46,7 @@ func TestMain(m *testing.M) {
 var defID = uuid.MustParse("00000000-0000-7000-8000-0000000000bb")
 
 type stack struct {
+	fence store.Fence
 	t     *testing.T
 	pool  *pgxpool.Pool
 	store *store.Store
@@ -60,8 +61,10 @@ func newStack(t *testing.T) *stack {
 		t.Fatal(err)
 	}
 	s := store.New(pool)
+	fence := pgtest.Lead(t, pool)
 	eng := engine.New(engine.Options{
 		Store: s,
+		Fence: func() store.Fence { return fence },
 		Config: engine.Config{
 			LeaseTTL: 3 * time.Second, HeartbeatInterval: 100 * time.Millisecond,
 			ClaimPoll: 20 * time.Millisecond,
@@ -72,7 +75,7 @@ func newStack(t *testing.T) *stack {
 	})
 	srv := httptest.NewServer(server.New(server.Deps{DB: pool, Worker: eng}))
 	t.Cleanup(srv.Close)
-	return &stack{t: t, pool: pool, store: s, url: srv.URL}
+	return &stack{fence: fence, t: t, pool: pool, store: s, url: srv.URL}
 }
 
 func (s *stack) seed(n int, handler string) uuid.UUID {
@@ -92,7 +95,7 @@ func (s *stack) seed(n int, handler string) uuid.UUID {
 	for _, id := range ids {
 		changes = append(changes, state.Change{TaskID: id, Payload: state.TaskReady{}})
 	}
-	if _, _, err := s.store.Update(s.t.Context(), store.Fence{}, wf, func(*state.Snapshot, time.Time) ([]state.Change, error) {
+	if _, _, err := s.store.Update(s.t.Context(), s.fence, wf, func(*state.Snapshot, time.Time) ([]state.Change, error) {
 		return changes, nil
 	}); err != nil {
 		s.t.Fatal(err)
