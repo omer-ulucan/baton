@@ -155,7 +155,7 @@ func TestOneLeaderAndFailoverAfterCrash(t *testing.T) {
 	if second.replica != follower.id {
 		t.Fatalf("term 2 went to %s", second.replica)
 	}
-	if took := second.start.Sub(crashed); took > ttl+ttl/3+300*time.Millisecond {
+	if took := second.start.Sub(crashed); took > ttl+ttl/6+300*time.Millisecond {
 		t.Fatalf("failover took %s, more than TTL plus one renewal period", took)
 	}
 	assertNoOverlap(t, rec.snapshot())
@@ -176,7 +176,7 @@ func TestGracefulShutdownHandsOverQuickly(t *testing.T) {
 		t.Fatalf("term 2 went to %s", second.replica)
 	}
 	// Released, not expired: one renewal period, not a whole TTL.
-	if took := second.start.Sub(stopped); took > ttl/3+300*time.Millisecond {
+	if took := second.start.Sub(stopped); took > ttl/6+300*time.Millisecond {
 		t.Fatalf("handover took %s", took)
 	}
 	assertNoOverlap(t, rec.snapshot())

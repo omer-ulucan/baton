@@ -30,7 +30,12 @@ within TTL/2 steps down on its own before its lease can expire.
   which is the only enforcement that holds under process pauses.
 - The `FOR SHARE` lock serializes takeover against in-flight leader
   transactions: takeover waits for them, and they fail after it.
-- Failover time is bounded by the lease TTL (default 10s) plus one renew period.
+- Failover time is bounded by the lease TTL (default 10s) plus one renew
+  period (TTL/6).
+- Renewal timing leaves slack on purpose: renew every TTL/6 with a TTL/3
+  deadline, step down after TTL/2 without success. The first version renewed
+  every TTL/3, which left a renewal only TTL/6 to complete before the
+  step-down deadline; a loaded test machine demoted a healthy leader.
 - Leader election availability equals Postgres availability, which we
   already depend on (ADR 0001); no new failure domain.
 - Every write transaction takes a share lock on one hot row. Shared locks

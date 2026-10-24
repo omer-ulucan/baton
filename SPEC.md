@@ -435,9 +435,13 @@ Snapshots are out of scope; replay of one workflow is O(events of that workflow)
 
 ### 6.1 Lease protocol
 
-Parameters: `BATON_LEADER_TTL` (default 10s), renew every TTL/3, a replica
-that fails to renew within TTL/2 of its last success MUST stop all leader
-loops and stop accepting writes before its lease could expire.
+Parameters: `BATON_LEADER_TTL` (default 10s); renew every TTL/6 with a
+TTL/3 deadline per attempt; a replica whose last successful renewal was
+sent TTL/2 ago MUST stop all leader loops and stop accepting writes, well
+before its lease could expire. A renewal may therefore take up to TTL/3, or
+one may fail outright, without costing leadership. (Renewing every TTL/3,
+as first specified, left only TTL/6 per round trip: under load a healthy
+leader stepped down.)
 
 Acquire or renew (one transaction, DB clock): update `leader_lease` where
 `holder_id = $me OR expires_at <= clock_timestamp()`, setting holder,

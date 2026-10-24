@@ -25,7 +25,13 @@ type Elector struct {
 	cfg   Config
 	log   *slog.Logger
 
-	renewEvery    time.Duration // TTL/3
+	// Renewals go out every TTL/6 with a TTL/3 deadline, and the leader
+	// steps down once its last successful renewal was sent TTL/2 ago. A
+	// renewal may thus take up to TTL/3, or one may fail outright, without
+	// costing leadership, while the leader still stops well before its
+	// lease can expire.
+	renewEvery    time.Duration // TTL/6
+	renewTimeout  time.Duration // TTL/3
 	stepDownAfter time.Duration // TTL/2 without a successful renewal
 
 	mu        sync.Mutex
@@ -49,7 +55,7 @@ func New(s *store.Store, cfg Config, log *slog.Logger) *Elector {
 	}
 	return &Elector{
 		store: s, cfg: cfg, log: log,
-		renewEvery: cfg.TTL / 3, stepDownAfter: cfg.TTL / 2,
+		renewEvery: cfg.TTL / 6, renewTimeout: cfg.TTL / 3, stepDownAfter: cfg.TTL / 2,
 	}
 }
 
@@ -76,7 +82,7 @@ func (e *Elector) Run(ctx context.Context, lead func(ctx context.Context, fence 
 
 func (e *Elector) campaign(ctx context.Context, lead func(context.Context, store.Fence)) {
 	sent := time.Now()
-	rctx, cancel := context.WithTimeout(ctx, e.renewEvery)
+	rctx, cancel := context.WithTimeout(ctx, e.renewTimeout)
 	token, ok, err := e.store.AcquireLeadership(rctx, e.cfg.ID, e.cfg.Addr, e.cfg.TTL)
 	cancel()
 	switch {
