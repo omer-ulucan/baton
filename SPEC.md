@@ -866,21 +866,34 @@ is never run during replay.
 
 ## 11. Observability
 
-- **Tracing** (OpenTelemetry, OTLP exporter, `OTEL_*` env vars): spans for
-  submission, each transaction, claim, worker execution (worker-side span
-  linked via `traceparent` stored in `TaskCreated`), complete/fail, decision
-  (`decision.policy`, `decision.label`, `decision.fallback` attributes).
-- **Metrics** (Prometheus, prefix `baton_`): `queue_depth{queue,status}`,
-  `claim_latency_seconds`, `task_duration_seconds{queue,outcome}`,
-  `task_retries_total{queue}`, `lease_expirations_total{queue}`,
-  `leader_changes_total`, `is_leader`, `decision_latency_seconds{kind,policy}`,
+- **Tracing** (OpenTelemetry, OTLP/HTTP, standard `OTEL_*` variables; off
+  unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set). Every HTTP request is a span
+  named after its route, continuing the caller's W3C `traceparent`.
+  Submission creates `workflow.submit`, whose context is stored in
+  `WorkflowSubmitted.traceparent` and handed to the worker with every claim;
+  the worker's `task.execute <handler>` span is its child, and the worker's
+  HTTP client propagates that span, so `task.complete` / `task.fail` join
+  the same trace. Claims that grant work create `task.claim`; decisions
+  create `decision` spans with `decision.kind/policy/label/confidence/
+  fallback` attributes; Postgres queries are traced with `otelpgx`. The
+  compose stack ships Jaeger.
+- **Metrics** (Prometheus at `GET /metrics`, prefix `baton_`, own registry):
+  `queue_depth{queue,status}`, `claim_latency_seconds`,
+  `task_duration_seconds{queue,outcome}` (succeeded, failed, expired,
+  released; from claim to end), `task_retries_total{queue}`,
+  `lease_expirations_total{queue}`, `workflows_finished_total{status}`,
+  `leader_changes_total`, `is_leader`, `fencing_rejections_total`,
+  `decision_latency_seconds{kind,policy}`, `decisions_total{kind,policy,label}`,
   `decision_fallback_total{kind,reason}`, `decision_model_loaded`,
-  `fencing_rejections_total`, `outbox_pending`.
-- **Logging**: `log/slog` JSON, with `workflow_id`, `task_id`, `attempt_id`,
-  `trace_id` attributes.
-- Grafana dashboard JSON provisioned from `deploy/grafana/`.
-
----
+  `outbox_pending`, `state_scrape_errors`, plus Go runtime and process
+  metrics. Queue depth and outbox are read from the database at scrape time,
+  so every replica reports them; dashboards aggregate with `max`.
+- **Logging**: `log/slog` JSON, with `replica`, `task`, `attempt`,
+  `workflow` attributes where relevant.
+- **Dashboard**: `deploy/grafana/dashboards/baton.json`, provisioned with
+  Prometheus and Jaeger datasources: leadership, fencing, outbox, queue
+  depth, claim latency, task duration and outcomes, retries and lease
+  expirations, decision latency, fallback rate and reasons, model state.
 
 ## 12. Configuration
 
