@@ -174,3 +174,11 @@ func (l *Loader) Close() error {
 	l.policy.model.Store(nil)
 	return m.Close()
 }
+
+// NewPolicyForModel returns a policy answering with an already loaded
+// model (the eval harness and tests).
+func NewPolicyForModel(m *Model) *Policy {
+	p := &Policy{}
+	p.model.Store(m)
+	return p
+}
