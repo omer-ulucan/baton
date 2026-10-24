@@ -265,3 +265,12 @@ func collectRefs(rows pgx.Rows) ([]TaskRef, error) {
 	}
 	return out, rows.Err()
 }
+
+// PurgeRevokedLeases deletes revoked leases whose time has passed. They
+// are kept until then so heartbeats can tell workers why they must stop.
+func (t *Tx) PurgeRevokedLeases(ctx context.Context) error {
+	if _, err := t.tx.Exec(ctx, `DELETE FROM task_leases WHERE revoked AND lease_until <= $1`, t.now); err != nil {
+		return fmt.Errorf("purge revoked leases: %w", err)
+	}
+	return nil
+}
