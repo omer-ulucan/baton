@@ -1,0 +1,19 @@
+# Saga demo: charge and reserve succeed, ship fails permanently, so the
+# completed steps are compensated in reverse order (release, then refund)
+# and the workflow ends "compensated".
+name: saga-demo
+version: 1
+steps:
+  - name: charge
+    handler: echo
+    input: { amount_cents: 1299 }
+    compensate: { handler: echo }
+  - name: reserve
+    handler: sleep
+    depends_on: [charge]
+    input: { ms: 100 }
+    compensate: { handler: echo }
+  - name: ship
+    handler: flaky
+    depends_on: [reserve]
+    input: { fail_attempts: 99, permanent: true, message: "carrier rejected the address" }
