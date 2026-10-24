@@ -13,6 +13,7 @@ import (
 	"github.com/omer-ulucan/baton/internal/decision"
 	"github.com/omer-ulucan/baton/internal/state"
 	"github.com/omer-ulucan/baton/internal/store"
+	"github.com/omer-ulucan/baton/internal/workflow"
 )
 
 // Worker is a registration request.
@@ -120,6 +121,15 @@ func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment,
 				return err
 			}
 			t := snap.Tasks[ref.TaskID]
+			def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+			if err != nil {
+				return err
+			}
+			sub, err := tx.Submission(ctx, ref.WorkflowID)
+			if err != nil {
+				return err
+			}
+			_, timeout := e.stepSettings(def, t)
 			att, err := uuid.NewV7()
 			if err != nil {
 				return err
@@ -135,9 +145,9 @@ func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment,
 			}
 			out = append(out, Assignment{
 				TaskID: t.ID, AttemptID: att, WorkflowID: t.WorkflowID, Step: t.StepName, Kind: t.Kind,
-				Handler: t.Handler, Queue: t.Queue, IdempotencyKey: t.IdempotencyKey,
+				Handler: t.Handler, Queue: t.Queue, Input: handlerInput(def, sub, t), IdempotencyKey: t.IdempotencyKey,
 				Attempt: t.Attempt, MaxAttempts: t.MaxAttempts,
-				Deadline: tx.Now().Add(e.timeout(t)), LeaseUntil: until,
+				Deadline: tx.Now().Add(timeout), LeaseUntil: until,
 			})
 		}
 		return nil
@@ -224,7 +234,7 @@ func (e *Engine) Complete(ctx context.Context, r Result, output json.RawMessage)
 		if err := e.checkLease(ctx, tx, snap, r, state.EvTaskSucceeded); err != nil {
 			return err
 		}
-		if _, err := tx.Append(ctx, snap, wf, []state.Change{{
+		if err := e.commit(ctx, tx, snap, wf, []state.Change{{
 			TaskID: r.TaskID, Payload: state.TaskSucceeded{AttemptID: r.AttemptID, OutputDigest: digest(output)},
 		}}); err != nil {
 			return err
@@ -296,13 +306,35 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 			return err
 		}
 		t := snap.Tasks[r.TaskID]
+		def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+		if err != nil {
+			return err
+		}
 		changes := []state.Change{
 			{TaskID: t.ID, Payload: state.TaskFailed{AttemptID: r.AttemptID, ErrorClass: f.Type, Message: f.Message, StackDigest: digest([]byte(f.Stack))}},
 			{TaskID: t.ID, Payload: decisionEvent(d, r.AttemptID, latency)},
 		}
 		var disposition state.Change
-		disposition, next = e.dispose(t, d.Label, tx.Now())
-		if _, err := tx.Append(ctx, snap, wf, append(changes, disposition)); err != nil {
+		disposition, next = e.dispose(def, t, d.Label, tx.Now())
+		changes = append(changes, disposition)
+		if next == NextDeadLetter && d.Label == decision.Compensate && t.Kind == state.KindStep {
+			// Fail now rather than waiting for siblings (SPEC 3.2).
+			sb := newSandbox(snap, wf)
+			sb.addAll(changes)
+			if snap.Workflow.Status == state.WfRunning || snap.Workflow.Status == state.WfPaused {
+				failWorkflow(sb, t.ID)
+			}
+			if sb.err != nil {
+				return sb.err
+			}
+			changes = sb.changes
+		}
+		if next == NextDeadLetter && d.Label == decision.Escalate {
+			if err := e.queueEscalation(ctx, tx, t, f, d); err != nil {
+				return err
+			}
+		}
+		if err := e.commit(ctx, tx, snap, wf, changes); err != nil {
 			return err
 		}
 		return tx.DeleteLease(ctx, t.ID)
@@ -316,9 +348,9 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 // dispose turns a triage label into the task's next event. Every label
 // but the two retry ones dead-letters the task; the workflow-level effects
 // of compensate and escalate are applied by the workflow engine.
-func (e *Engine) dispose(t *state.Task, label string, now time.Time) (state.Change, Next) {
+func (e *Engine) dispose(def *workflow.Definition, t *state.Task, label string, now time.Time) (state.Change, Next) {
 	if (label == decision.Retry || label == decision.RetryWithBackoff) && t.Attempt < t.MaxAttempts {
-		p := e.retryPolicy(t)
+		p, _ := e.stepSettings(def, t)
 		delay := p.InitialBackoff
 		if label == decision.RetryWithBackoff {
 			delay = p.Backoff(t.Attempt, e.rand)
@@ -401,7 +433,7 @@ func (e *Engine) Release(ctx context.Context, workerID string, attempts []uuid.U
 			if t.Status != state.TsRunning || t.CurrentAttempt == nil || *t.CurrentAttempt != l.AttemptID {
 				return tx.DeleteLease(ctx, l.TaskID)
 			}
-			if _, err := tx.Append(ctx, snap, l.WorkflowID, []state.Change{{
+			if err := e.commit(ctx, tx, snap, l.WorkflowID, []state.Change{{
 				TaskID: l.TaskID, Payload: state.TaskReleased{AttemptID: l.AttemptID},
 			}}); err != nil {
 				return err

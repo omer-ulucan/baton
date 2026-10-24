@@ -11,13 +11,17 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/omer-ulucan/baton/internal/decision"
 	"github.com/omer-ulucan/baton/internal/retry"
 	"github.com/omer-ulucan/baton/internal/state"
 	"github.com/omer-ulucan/baton/internal/store"
+	"github.com/omer-ulucan/baton/internal/workflow"
 )
 
 // Protocol errors. The HTTP layer maps them to status codes.
@@ -54,12 +58,18 @@ type Options struct {
 	Fence func() store.Fence
 	// Policy triages failures; defaults to decision.RulePolicy.
 	Policy decision.Policy
-	// RetryPolicy returns a task's retry policy; defaults to retry.DefaultPolicy.
+	// RetryPolicy overrides the retry policy from the task's definition
+	// (tests use it for fast retries).
 	RetryPolicy func(*state.Task) retry.Policy
-	// Timeout returns a task's per-attempt timeout; defaults to Config.DefaultTimeout.
+	// Timeout overrides the per-attempt timeout from the definition.
 	Timeout func(*state.Task) time.Duration
 	// Rand returns uniform values in [0,1) for jitter; defaults to math/rand/v2.
 	Rand func() float64
+	// EscalationURL receives escalation messages via the outbox; empty
+	// disables them (the task is still dead-lettered).
+	EscalationURL string
+	// HTTPClient delivers outbox messages; defaults to a 5s-timeout client.
+	HTTPClient *http.Client
 }
 
 // Engine implements the worker protocol and the leader's timer loops.
@@ -73,6 +83,9 @@ type Engine struct {
 	timeout     func(*state.Task) time.Duration
 	rand        func() float64
 	ready       *notifier
+	defs        *definitions
+	escalateURL string
+	http        *http.Client
 }
 
 // New builds an Engine, filling defaults.
@@ -95,6 +108,11 @@ func New(o Options) *Engine {
 	e := &Engine{
 		store: o.Store, log: o.Log, cfg: c, fence: o.Fence, policy: o.Policy,
 		retryPolicy: o.RetryPolicy, timeout: o.Timeout, rand: o.Rand, ready: newNotifier(),
+		defs:        &definitions{store: o.Store, byID: map[uuid.UUID]*workflow.Definition{}},
+		escalateURL: o.EscalationURL, http: o.HTTPClient,
+	}
+	if e.http == nil {
+		e.http = &http.Client{Timeout: 5 * time.Second}
 	}
 	if e.log == nil {
 		e.log = slog.New(slog.DiscardHandler)
@@ -104,12 +122,6 @@ func New(o Options) *Engine {
 	}
 	if e.policy == nil {
 		e.policy = decision.RulePolicy{}
-	}
-	if e.retryPolicy == nil {
-		e.retryPolicy = func(*state.Task) retry.Policy { return retry.DefaultPolicy() }
-	}
-	if e.timeout == nil {
-		e.timeout = func(*state.Task) time.Duration { return c.DefaultTimeout }
 	}
 	if e.rand == nil {
 		e.rand = rand.Float64
@@ -126,6 +138,8 @@ func (e *Engine) Run(ctx context.Context) {
 	defer reap.Stop()
 	retries := time.NewTicker(e.cfg.RetryInterval)
 	defer retries.Stop()
+	outbox := time.NewTicker(500 * time.Millisecond)
+	defer outbox.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -137,6 +151,10 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-retries.C:
 			if _, err := e.PromoteRetries(ctx); err != nil && ctx.Err() == nil {
 				e.log.ErrorContext(ctx, "retry timer", "err", err)
+			}
+		case <-outbox.C:
+			if _, err := e.RelayOutbox(ctx); err != nil && ctx.Err() == nil {
+				e.log.ErrorContext(ctx, "outbox relay", "err", err)
 			}
 		}
 	}

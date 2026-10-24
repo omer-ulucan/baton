@@ -36,8 +36,12 @@ func (e *Engine) ReapExpired(ctx context.Context) (int, error) {
 				}
 				continue
 			}
-			disposition, _ := e.dispose(t, decision.RetryWithBackoff, tx.Now())
-			if _, err := tx.Append(ctx, snap, l.WorkflowID, []state.Change{
+			def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+			if err != nil {
+				return err
+			}
+			disposition, _ := e.dispose(def, t, decision.RetryWithBackoff, tx.Now())
+			if err := e.commit(ctx, tx, snap, l.WorkflowID, []state.Change{
 				{TaskID: t.ID, Payload: state.TaskLeaseExpired{AttemptID: l.AttemptID}},
 				disposition,
 			}); err != nil {
@@ -74,7 +78,7 @@ func (e *Engine) PromoteRetries(ctx context.Context) (int, error) {
 			if err != nil {
 				return err
 			}
-			if _, err := tx.Append(ctx, snap, ref.WorkflowID, []state.Change{{TaskID: ref.TaskID, Payload: state.TaskReady{}}}); err != nil {
+			if err := e.commit(ctx, tx, snap, ref.WorkflowID, []state.Change{{TaskID: ref.TaskID, Payload: state.TaskReady{}}}); err != nil {
 				return err
 			}
 			n++
@@ -83,9 +87,6 @@ func (e *Engine) PromoteRetries(ctx context.Context) (int, error) {
 	})
 	if err != nil {
 		return 0, err
-	}
-	if n > 0 {
-		e.ready.notify()
 	}
 	return n, nil
 }
