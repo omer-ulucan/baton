@@ -156,6 +156,14 @@ Terminal task states: `succeeded`, `dead_lettered`, `cancelled`, `skipped`.
 `dead_lettered` is terminal for scheduling but MAY be left by a manual DLQ
 retry (the only transition out of a terminal state).
 
+`TaskFailed` and `TaskLeaseExpired` end the attempt (clearing
+`current_attempt` and `worker_id`) but leave the status `running`; they are
+always followed, in the same transaction, by `TaskRetryScheduled` or
+`TaskDeadLettered`, which are valid only on a `running` task with no
+current attempt. The intermediate state is never visible outside the
+transaction. `TaskReleased` returns the attempt (`attempt` decremented) and
+keeps the original `ready_at`, so a released task does not lose its aging.
+
 `retry` vs `retry_with_backoff`: `retry` schedules `run_at = now() + initial_backoff`
 with no growth; `retry_with_backoff` uses section 2.2. Both still respect
 `max_attempts`.
@@ -182,7 +190,8 @@ cancelled), which starts compensation.
 | `running`, `paused`, `deferred` | `WorkflowCancelRequested` + `WorkflowCancelled` | `cancelled` | API, `compensate: false`; all non-terminal tasks get `TaskCancelled` in the same transaction |
 | `running`, `paused` | `WorkflowCancelRequested` + `CompensationStarted` | `compensating` | API, `compensate: true`; non-terminal step tasks get `TaskCancelled` in the same transaction |
 | `compensating` | `WorkflowCancelled` | `cancelled` | compensation chain finished (either outcome) and the cancel request started it |
-| `failed`, `compensation_failed` | `WorkflowRetried` | `running` | manual DLQ retry of a task of this workflow |
+| `failed` | `WorkflowRetried` | `running` | manual DLQ retry of a step task of this workflow |
+| `compensation_failed` | `WorkflowRetried` | `compensating` | manual DLQ retry of a compensation task; the chain resumes |
 
 Terminal workflow states: `succeeded`, `failed`, `compensated`,
 `compensation_failed`, `cancelled`. `failed` and `compensation_failed` may
@@ -216,8 +225,14 @@ of a workflow is claimed after its `WorkflowCancelled` event.
   `retry_with_backoff` or `dead_letter` (`compensate` and `escalate` map to
   `dead_letter` + escalation message).
 - If any compensation task is dead-lettered, the workflow becomes
-  `compensation_failed`; remaining compensations are not run (they stay
-  `pending` -> `skipped`). A manual DLQ retry resumes the chain.
+  `compensation_failed`; remaining compensations are not run and stay
+  `pending` (unclaimable, since claims of compensation tasks require the
+  workflow to be `compensating`). A manual DLQ retry resumes the chain from
+  the dead-lettered task. Only a cancel-initiated chain skips its remaining
+  compensations, because `cancelled` requires every task to be terminal.
+- A manual DLQ retry of a step task in a `failed` workflow returns that
+  workflow's `skipped` and `cancelled` step tasks to `pending` (in the
+  `WorkflowRetried` event), so the rest of the DAG can run again.
 
 ---
 
@@ -261,7 +276,8 @@ CREATE TABLE workflow_events (
   UNIQUE (workflow_id, seq)
 );
 -- Append-only: UPDATE and DELETE are rejected by trigger.
--- Fencing:     BEFORE INSERT trigger, section 6.2.
+-- Fencing:     BEFORE INSERT trigger, section 6.2 (migration added with
+--              leader election in phase 5, together with leader_lease).
 
 -- Projections (rebuildable from events)
 CREATE TABLE workflows (
@@ -270,6 +286,7 @@ CREATE TABLE workflows (
   status          text NOT NULL,
   priority        int  NOT NULL,
   submit_key      text UNIQUE,                    -- client idempotency key
+  cancel_requested bool NOT NULL DEFAULT false,   -- set by WorkflowCancelRequested
   last_seq        int  NOT NULL,                  -- seq of last applied event
   created_at      timestamptz NOT NULL,           -- = occurred_at of WorkflowSubmitted
   updated_at      timestamptz NOT NULL,           -- = occurred_at of last event

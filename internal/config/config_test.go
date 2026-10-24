@@ -29,6 +29,9 @@ func TestOrchestratorDefaults(t *testing.T) {
 	if c.LeaderTTL != 10*time.Second || c.LeaseTTL != 30*time.Second || c.HeartbeatInterval != 10*time.Second {
 		t.Errorf("unexpected durations: %+v", c)
 	}
+	if !c.AutoMigrate {
+		t.Error("AutoMigrate should default to true")
+	}
 	if c.AgingSeconds != 30 {
 		t.Errorf("AgingSeconds = %d, want 30", c.AgingSeconds)
 	}
@@ -47,6 +50,7 @@ func TestOrchestratorOverrides(t *testing.T) {
 		"BATON_HEARTBEAT_INTERVAL": "15s",
 		"BATON_DECISION_POLICY":    "laya",
 		"BATON_DECISION_THRESHOLD": "0.7",
+		"BATON_AUTO_MIGRATE":       "false",
 	}), "ignored")
 	if err != nil {
 		t.Fatalf("LoadOrchestrator: %v", err)
@@ -56,6 +60,9 @@ func TestOrchestratorOverrides(t *testing.T) {
 	}
 	if c.LeaseTTL != 45*time.Second || c.HeartbeatInterval != 15*time.Second {
 		t.Errorf("durations not applied: %+v", c)
+	}
+	if c.AutoMigrate {
+		t.Error("AutoMigrate override not applied")
 	}
 	if c.DecisionPolicy != "laya" || c.DecisionThreshold != 0.7 {
 		t.Errorf("decision not applied: %+v", c)
@@ -76,6 +83,7 @@ func TestOrchestratorValidation(t *testing.T) {
 		{"unknown policy", map[string]string{"BATON_DECISION_POLICY": "magic"}, "BATON_DECISION_POLICY"},
 		{"threshold out of range", map[string]string{"BATON_DECISION_THRESHOLD": "1.5"}, "BATON_DECISION_THRESHOLD"},
 		{"bad int", map[string]string{"BATON_AGING_SECONDS": "x"}, "BATON_AGING_SECONDS"},
+		{"bad bool", map[string]string{"BATON_AUTO_MIGRATE": "maybe"}, "BATON_AUTO_MIGRATE"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

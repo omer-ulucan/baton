@@ -15,6 +15,7 @@ import (
 // Orchestrator is the configuration of a baton replica.
 type Orchestrator struct {
 	DatabaseURL       string
+	AutoMigrate       bool // apply pending migrations at startup
 	HTTPAddr          string
 	AdvertiseAddr     string // address other replicas use to reach this one
 	ReplicaID         string
@@ -42,6 +43,7 @@ func LoadOrchestrator(getenv func(string) string, hostname string) (Orchestrator
 	r := reader{getenv: getenv}
 	c := Orchestrator{
 		DatabaseURL:       r.str("BATON_DATABASE_URL", ""),
+		AutoMigrate:       r.boolean("BATON_AUTO_MIGRATE", true),
 		HTTPAddr:          r.str("BATON_HTTP_ADDR", ":8080"),
 		ReplicaID:         r.str("BATON_REPLICA_ID", hostname),
 		LeaderTTL:         r.duration("BATON_LEADER_TTL", 10*time.Second),
@@ -143,6 +145,19 @@ func (r *reader) duration(key string, def time.Duration) time.Duration {
 		r.fail("%s must be positive, got %s", key, d)
 	}
 	return d
+}
+
+func (r *reader) boolean(key string, def bool) bool {
+	v := strings.TrimSpace(r.getenv(key))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		r.fail("%s: %v", key, err)
+		return def
+	}
+	return b
 }
 
 func (r *reader) positiveInt(key string, def int) int {
