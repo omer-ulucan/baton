@@ -1,0 +1,41 @@
+# Binaries
+/bin/
+/dist/
+/baton
+/baton-worker
+/batonctl
+*.exe
+*.test
+*.out
+
+# Model cache and weights (never committed)
+/.cache/
+/models/
+*.onnx
+*.onnx_data
+*.safetensors
+*.bin
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Coverage and profiling
+coverage.*
+*.coverprofile
+*.pprof
+cpu.prof
+mem.prof
+
+# Python tooling (tools/parity only, never runtime)
+__pycache__/
+*.pyc
+.venv/
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
