@@ -30,10 +30,15 @@ import (
 
 // Options configure a replica.
 type Options struct {
-	Config   config.Orchestrator
-	Pool     *pgxpool.Pool
-	Listener net.Listener // serves HTTP; its address need not match Config.HTTPAddr
-	Log      *slog.Logger
+	Config config.Orchestrator
+	Pool   *pgxpool.Pool
+	// LeaderPool serves lease renewals only. Under database latency,
+	// workload transactions hold every pooled connection for seconds and a
+	// renewal waiting for one misses its deadline, so production replicas
+	// pass a small dedicated pool (see NewLeaderPool). Nil shares Pool.
+	LeaderPool *pgxpool.Pool
+	Listener   net.Listener // serves HTTP; its address need not match Config.HTTPAddr
+	Log        *slog.Logger
 	// Engine, when set, adjusts engine options (tests use it for fast
 	// retries and short polls).
 	Engine func(*engine.Options)
@@ -44,15 +49,18 @@ type Options struct {
 
 // Replica is one orchestrator process.
 type Replica struct {
-	cfg     config.Orchestrator
-	pool    *pgxpool.Pool
-	ln      net.Listener
-	log     *slog.Logger
-	store   *store.Store
-	elector *leader.Elector
-	engine  *engine.Engine
-	loader  *laya.Loader // nil with the rule policy
-	http    *http.Server
+	cfg  config.Orchestrator
+	pool *pgxpool.Pool
+	// leaderPool serves lease renewals only, so they never queue behind
+	// workload transactions for a connection (nil: shares pool).
+	leaderPool *pgxpool.Pool
+	ln         net.Listener
+	log        *slog.Logger
+	store      *store.Store
+	elector    *leader.Elector
+	engine     *engine.Engine
+	loader     *laya.Loader // nil with the rule policy
+	http       *http.Server
 
 	killOnce sync.Once
 	killed   chan struct{}
@@ -72,7 +80,11 @@ func New(o Options) *Replica {
 		o.Tracer = noop.NewTracerProvider()
 	}
 	st := store.New(o.Pool)
-	el := leader.New(st, leader.Config{ID: o.Config.ReplicaID, Addr: o.Config.AdvertiseAddr, TTL: o.Config.LeaderTTL}, log)
+	leaderStore := st
+	if o.LeaderPool != nil {
+		leaderStore = store.New(o.LeaderPool)
+	}
+	el := leader.New(leaderStore, leader.Config{ID: o.Config.ReplicaID, Addr: o.Config.AdvertiseAddr, TTL: o.Config.LeaderTTL}, log)
 	policy, loader := decisionPolicy(o.Config, log, o.Metrics.Decision)
 	sources := telemetry.Sources{QueueStats: st.QueueStats, OutboxPending: st.OutboxPending, IsLeader: el.IsLeader, LeaderChanges: el.Changes}
 	if loader != nil {
@@ -99,7 +111,7 @@ func New(o Options) *Replica {
 		Metrics: o.Metrics.Handler(), Tracer: o.Tracer,
 	})
 	return &Replica{
-		cfg: o.Config, pool: o.Pool, ln: o.Listener, log: log, store: st, elector: el, engine: eng, loader: loader,
+		cfg: o.Config, pool: o.Pool, leaderPool: o.LeaderPool, ln: o.Listener, log: log, store: st, elector: el, engine: eng, loader: loader,
 		http:   &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
 		killed: make(chan struct{}),
 	}
@@ -122,6 +134,9 @@ func (r *Replica) Run(ctx context.Context) error {
 	go func() { errc <- r.http.Serve(r.ln) }()
 	r.log.Info("listening", "addr", r.ln.Addr().String(), "advertise", r.cfg.AdvertiseAddr)
 
+	if r.leaderPool != nil {
+		defer r.leaderPool.Close() // after the elector stopped and released the lease
+	}
 	elCtx, stopEl := context.WithCancel(ctx)
 	defer stopEl()
 	elDone := make(chan struct{})
@@ -164,6 +179,14 @@ func (r *Replica) Run(ctx context.Context) error {
 	return nil
 }
 
+// NewLeaderPool opens the dedicated two-connection pool for lease
+// renewals, with the main pool's settings.
+func NewLeaderPool(ctx context.Context, main *pgxpool.Pool) (*pgxpool.Pool, error) {
+	c := main.Config()
+	c.MaxConns, c.MinConns = 2, 1
+	return pgxpool.NewWithConfig(ctx, c)
+}
+
 // decisionPolicy builds the policy the engine uses: always the fallback
 // policy, with Laya as primary when configured (SPEC 10.1).
 func decisionPolicy(c config.Orchestrator, log *slog.Logger, observe func(decision.Request, decision.Decision, time.Duration)) (decision.Policy, *laya.Loader) {
@@ -202,6 +225,9 @@ func (r *Replica) Kill() {
 		close(r.killed)
 		_ = r.http.Close()
 		r.pool.Close()
+		if r.leaderPool != nil {
+			r.leaderPool.Close()
+		}
 	})
 }
 
