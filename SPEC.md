@@ -225,8 +225,14 @@ of a workflow is claimed after its `WorkflowCancelled` event.
   `retry_with_backoff` or `dead_letter` (`compensate` and `escalate` map to
   `dead_letter` + escalation message).
 - If any compensation task is dead-lettered, the workflow becomes
-  `compensation_failed`; remaining compensations are not run (they stay
-  `pending` -> `skipped`). A manual DLQ retry resumes the chain.
+  `compensation_failed`; remaining compensations are not run and stay
+  `pending` (unclaimable, since claims of compensation tasks require the
+  workflow to be `compensating`). A manual DLQ retry resumes the chain from
+  the dead-lettered task. Only a cancel-initiated chain skips its remaining
+  compensations, because `cancelled` requires every task to be terminal.
+- A manual DLQ retry of a step task in a `failed` workflow returns that
+  workflow's `skipped` and `cancelled` step tasks to `pending` (in the
+  `WorkflowRetried` event), so the rest of the DAG can run again.
 
 ---
 
