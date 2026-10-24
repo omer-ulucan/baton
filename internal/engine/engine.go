@@ -46,6 +46,8 @@ type Config struct {
 	RetryInterval     time.Duration // default 500ms
 	DecisionTimeout   time.Duration // triage budget, default 1500ms
 	DefaultTimeout    time.Duration // per-attempt timeout without a step setting, default 5m
+	AgingSeconds      int           // one priority point per this many seconds ready, default 30
+	AdmitInterval     time.Duration // deferred-workflow admission, default 1s
 }
 
 // Options are the engine's collaborators.
@@ -90,6 +92,7 @@ type Engine struct {
 	escalateURL string
 	http        *http.Client
 	onFenced    func()
+	rates       buckets
 }
 
 // New builds an Engine, filling defaults.
@@ -109,6 +112,10 @@ func New(o Options) *Engine {
 	if c.LoopBatch <= 0 {
 		c.LoopBatch = 100
 	}
+	if c.AgingSeconds <= 0 {
+		c.AgingSeconds = 30
+	}
+	c.AdmitInterval = orDefault(c.AdmitInterval, time.Second)
 	e := &Engine{
 		store: o.Store, log: o.Log, cfg: c, fence: o.Fence, policy: o.Policy,
 		retryPolicy: o.RetryPolicy, timeout: o.Timeout, rand: o.Rand, ready: newNotifier(),
@@ -144,6 +151,8 @@ func (e *Engine) Run(ctx context.Context) {
 	defer retries.Stop()
 	outbox := time.NewTicker(500 * time.Millisecond)
 	defer outbox.Stop()
+	admit := time.NewTicker(e.cfg.AdmitInterval)
+	defer admit.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -159,6 +168,10 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-outbox.C:
 			if _, err := e.RelayOutbox(ctx); err != nil && ctx.Err() == nil {
 				e.log.ErrorContext(ctx, "outbox relay", "err", err)
+			}
+		case <-admit.C:
+			if _, err := e.AdmitDeferred(ctx); err != nil && ctx.Err() == nil {
+				e.log.ErrorContext(ctx, "admission", "err", err)
 			}
 		}
 	}
