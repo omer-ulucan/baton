@@ -16,6 +16,11 @@ import (
 
 // InsertDefinition stores a definition, deduplicated by its hash, and
 // returns its id.
+//
+// The lookup after a conflict must be a separate statement: a statement's
+// snapshot predates a concurrent inserter's commit, so a combined
+// INSERT ... ON CONFLICT DO NOTHING / SELECT can see neither row. Under
+// READ COMMITTED the second statement takes a fresh snapshot.
 func (t *Tx) InsertDefinition(ctx context.Context, name string, version int, sha []byte, spec []byte) (uuid.UUID, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -23,14 +28,13 @@ func (t *Tx) InsertDefinition(ctx context.Context, name string, version int, sha
 	}
 	var got uuid.UUID
 	err = t.tx.QueryRow(ctx, `
-		WITH ins AS (
-			INSERT INTO workflow_definitions (id, name, version, sha256, spec, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (sha256) DO NOTHING
-			RETURNING id
-		)
-		SELECT id FROM ins UNION ALL SELECT id FROM workflow_definitions WHERE sha256 = $4
-		LIMIT 1`, id, name, version, sha, spec, t.now).Scan(&got)
+		INSERT INTO workflow_definitions (id, name, version, sha256, spec, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (sha256) DO NOTHING
+		RETURNING id`, id, name, version, sha, spec, t.now).Scan(&got)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = t.tx.QueryRow(ctx, `SELECT id FROM workflow_definitions WHERE sha256 = $1`, sha).Scan(&got)
+	}
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("insert definition: %w", err)
 	}
