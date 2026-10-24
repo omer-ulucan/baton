@@ -61,25 +61,41 @@ func (t *Tx) Worker(ctx context.Context, id string) (queues, handlers []string, 
 	return queues, handlers, true, nil
 }
 
+// Candidate is a claimable task.
+type Candidate struct {
+	TaskRef
+	Queue string
+}
+
 // ClaimCandidates locks up to limit ready tasks a worker may run, together
-// with their workflow rows. It locks task before workflow, against the
-// usual order, so it uses SKIP LOCKED for both: it never waits, and a
-// workflow being written by someone else is simply skipped this round.
-func (t *Tx) ClaimCandidates(ctx context.Context, queues, handlers []string, limit int) ([]TaskRef, error) {
+// with their workflow rows, best first by aged priority (SPEC 9.2). It
+// locks task before workflow, against the usual order, so it uses SKIP
+// LOCKED for both: it never waits, and a workflow being written by someone
+// else is simply skipped this round.
+func (t *Tx) ClaimCandidates(ctx context.Context, queues, handlers []string, limit, agingSeconds int) ([]Candidate, error) {
 	rows, err := t.tx.Query(ctx, `
-		SELECT t.id, t.workflow_id
+		SELECT t.id, t.workflow_id, t.queue
 		  FROM tasks t JOIN workflows w ON w.id = t.workflow_id
 		 WHERE t.status = 'ready'
-		   AND t.queue = ANY($1) AND t.handler = ANY($2)
+		   AND t.queue = ANY($2) AND t.handler = ANY($3)
 		   AND ((t.kind = 'step' AND w.status = 'running')
 		     OR (t.kind = 'compensation' AND w.status = 'compensating'))
-		 ORDER BY t.priority DESC, t.ready_at, t.id
-		 LIMIT $3
-		 FOR UPDATE OF t, w SKIP LOCKED`, queues, handlers, limit)
+		 ORDER BY `+effectivePriority(agingSeconds)+` DESC, t.ready_at, t.id
+		 LIMIT $4
+		 FOR UPDATE OF t, w SKIP LOCKED`, t.now, queues, handlers, limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim candidates: %w", err)
 	}
-	return collectRefs(rows)
+	defer rows.Close()
+	var out []Candidate
+	for rows.Next() {
+		var c Candidate
+		if err := rows.Scan(&c.TaskID, &c.WorkflowID, &c.Queue); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // InsertLease grants a lease for a claimed attempt, valid for ttl from now.
