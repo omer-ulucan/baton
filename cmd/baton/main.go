@@ -92,12 +92,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("database: %w", err)
 	}
 	defer pool.Close()
+	leaderPool, err := orchestrator.NewLeaderPool(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	// Closed by the replica after it released the lease.
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.HTTPAddr)
 	if err != nil {
 		return err
 	}
 	return orchestrator.New(orchestrator.Options{
-		Config: cfg, Pool: pool, Listener: ln, Log: log, Tracer: tracing.Provider,
+		Config: cfg, Pool: pool, LeaderPool: leaderPool, Listener: ln, Log: log, Tracer: tracing.Provider,
 	}).Run(ctx)
 }
 
