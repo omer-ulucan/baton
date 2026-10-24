@@ -1,0 +1,3 @@
+# Offline parity tooling only; never a runtime dependency of Baton.
+onnx==1.23.2
+tokenizers==0.23.3
