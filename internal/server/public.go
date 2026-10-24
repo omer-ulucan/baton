@@ -25,6 +25,7 @@ type Commands interface {
 	Pause(ctx context.Context, wfID uuid.UUID) error
 	Resume(ctx context.Context, wfID uuid.UUID) error
 	RetryDLQ(ctx context.Context, taskID uuid.UUID, by string) error
+	SetQueue(ctx context.Context, c store.QueueConfig) error
 }
 
 // Reader is the public API's read side; any replica can serve it.
@@ -33,6 +34,7 @@ type Reader interface {
 	Events(ctx context.Context, wfID uuid.UUID) ([]state.Event, error)
 	ListWorkflows(ctx context.Context, status string, after uuid.UUID, limit int) ([]state.Workflow, error)
 	ListDLQ(ctx context.Context, queue string, after uuid.UUID, limit int) ([]store.DLQEntry, error)
+	QueueStats(ctx context.Context) ([]store.QueueStat, error)
 }
 
 const maxDefinition = 1 << 20
@@ -45,12 +47,14 @@ func registerPublicRoutes(mux *http.ServeMux, cmd Commands, rd Reader, fw *forwa
 		mux.Handle("POST /v1/workflows/{id}/pause", fw.write(h.simple(cmd.Pause)))
 		mux.Handle("POST /v1/workflows/{id}/resume", fw.write(h.simple(cmd.Resume)))
 		mux.Handle("POST /v1/dlq/{task_id}/retry", fw.write(h.retryDLQ))
+		mux.Handle("PUT /v1/queues/{queue}", fw.write(h.setQueue))
 	}
 	if rd != nil {
 		mux.HandleFunc("GET /v1/workflows", h.list)
 		mux.HandleFunc("GET /v1/workflows/{id}", h.get)
 		mux.HandleFunc("GET /v1/workflows/{id}/events", h.events)
 		mux.HandleFunc("GET /v1/dlq", h.dlq)
+		mux.HandleFunc("GET /v1/queues", h.queues)
 	}
 }
 
@@ -243,9 +247,50 @@ func (h publicHandlers) dlq(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (h publicHandlers) queues(w http.ResponseWriter, r *http.Request) {
+	stats, err := h.rd.QueueStats(r.Context())
+	if err != nil {
+		h.respondErr(w, r, err)
+		return
+	}
+	resp := api.QueueList{Queues: []api.Queue{}}
+	for _, st := range stats {
+		c := st.Config
+		resp.Queues = append(resp.Queues, api.Queue{
+			Queue: st.Queue, Pending: st.Pending, Ready: st.Ready, Running: st.Running, RetryWait: st.RetryWait,
+			DeadLettered: st.DeadLettered, Config: api.QueueConfig{MaxConcurrency: c.MaxConcurrency,
+				RatePerSec: c.RatePerSec, Burst: c.Burst, MaxDepth: c.MaxDepth, AdmissionMode: c.AdmissionMode},
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h publicHandlers) setQueue(w http.ResponseWriter, r *http.Request) {
+	var req api.QueueConfig
+	if !decode(w, r, &req) {
+		return
+	}
+	c := store.QueueConfig{Queue: r.PathValue("queue"), MaxConcurrency: req.MaxConcurrency, RatePerSec: req.RatePerSec,
+		Burst: req.Burst, MaxDepth: req.MaxDepth, AdmissionMode: req.AdmissionMode}
+	if err := h.cmd.SetQueue(r.Context(), c); err != nil {
+		if errors.Is(err, engine.ErrInvalid) {
+			writePublicError(w, http.StatusUnprocessableEntity, api.CodeInvalidRequest, err.Error(), nil)
+			return
+		}
+		h.respondErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, api.StatusResponse{Status: "updated"})
+}
+
 func (h publicHandlers) respondErr(w http.ResponseWriter, r *http.Request, err error) {
 	var ve *workflow.ValidationError
+	var full *engine.ErrQueueFull
 	switch {
+	case errors.As(err, &full):
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(full.RetryAfter.Seconds()))))
+		writePublicError(w, http.StatusTooManyRequests, api.CodeQueueFull, err.Error(),
+			map[string]any{"queue": full.Queue, "depth": full.Depth, "max_depth": full.MaxDepth})
 	case errors.Is(err, store.ErrFenced):
 		notLeader(w)
 	case errors.As(err, &ve):

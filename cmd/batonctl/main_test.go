@@ -182,3 +182,17 @@ func TestDLQCommands(t *testing.T) {
 		t.Fatalf("code=%d out=%q", code, out)
 	}
 }
+
+func TestQueuesCommands(t *testing.T) {
+	f, url := newFake(t)
+	f.on("GET /v1/queues", 200, `{"queues":[{"queue":"payments","ready":3,"running":2,"config":{"max_concurrency":2,"rate_per_sec":5,"burst":2,"admission_mode":"defer"}}]}`)
+	code, out, _ := runCLI(t, url, "queues")
+	if code != 0 || !strings.Contains(out, "payments") || !strings.Contains(out, "5/s (burst 2)") || !strings.Contains(out, "defer") {
+		t.Fatalf("code=%d out=%q", code, out)
+	}
+	f.on("PUT /v1/queues/payments", 200, `{"status":"updated"}`)
+	code, _, _ = runCLI(t, url, "queues", "set", "payments", "--max-concurrency", "3", "--admission", "reject")
+	if c := f.last(); code != 0 || c.body["max_concurrency"] != float64(3) || c.body["admission_mode"] != "reject" || c.body["max_depth"] != nil {
+		t.Fatalf("code=%d request=%+v", code, c)
+	}
+}

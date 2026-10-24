@@ -25,6 +25,9 @@ commands:
   resume ID
   dlq list [--queue Q] [--limit N]
   dlq retry TASK_ID
+  queues                     load and limits per queue
+  queues set QUEUE [--max-concurrency N] [--rate R] [--burst B]
+                   [--max-depth D] [--admission reject|defer]
   health                     check that the orchestrator is ready
   version                    print the batonctl version
 
@@ -85,6 +88,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 		err = c.lifecycle(cmd, rest)
 	case "dlq":
 		err = c.dlq(rest)
+	case "queues":
+		err = c.queues(rest)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n", cmd)
 		fs.Usage()

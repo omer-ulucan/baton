@@ -14,6 +14,7 @@ servers:
 tags:
   - name: workflows
   - name: dlq
+  - name: queues
   - name: worker
   - name: ops
 
@@ -131,6 +132,35 @@ paths:
         "200": { $ref: "#/components/responses/Status" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/queues:
+    get:
+      tags: [queues]
+      summary: Load and backpressure settings per queue
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queues: { type: array, items: { $ref: "#/components/schemas/Queue" } }
+
+  /v1/queues/{queue}:
+    put:
+      tags: [queues]
+      summary: Set a queue's limits (absent fields are unlimited)
+      parameters:
+        - { name: queue, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9-]{1,63}$" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QueueConfig" }
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
 
   /v1/worker/register:
     post:
@@ -489,6 +519,27 @@ components:
                   confidence: { type: number }
                   policy: { type: string }
                   fallback: { type: string }
+
+    QueueConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrency: { type: integer, minimum: 1, description: Running tasks allowed at once. }
+        rate_per_sec: { type: number, exclusiveMinimum: 0, description: Claims per second (token bucket). }
+        burst: { type: integer, minimum: 1, description: Token bucket size; default 1. }
+        max_depth: { type: integer, minimum: 1, description: "Backlog (pending, ready, retry_wait) beyond which submissions are rejected or deferred." }
+        admission_mode: { type: string, enum: [reject, defer], default: reject }
+
+    Queue:
+      type: object
+      properties:
+        queue: { type: string }
+        pending: { type: integer }
+        ready: { type: integer }
+        running: { type: integer }
+        retry_wait: { type: integer }
+        dead_lettered: { type: integer }
+        config: { $ref: "#/components/schemas/QueueConfig" }
 
     Assignment:
       type: object

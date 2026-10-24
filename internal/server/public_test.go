@@ -212,3 +212,41 @@ func TestDLQEndpoints(t *testing.T) {
 		t.Fatalf("after retry: %+v", wf)
 	}
 }
+
+func TestQueueEndpointsAndAdmission(t *testing.T) {
+	c := newAPI(t)
+	var eb api.ErrorBody
+	if code := c.do("PUT", "/v1/queues/q", api.QueueConfig{MaxConcurrency: ptrTo(0)}, nil, &eb); code != 422 {
+		t.Fatalf("invalid config = %d %+v", code, eb)
+	}
+	var st api.StatusResponse
+	if code := c.do("PUT", "/v1/queues/q", api.QueueConfig{MaxDepth: ptrTo(2), MaxConcurrency: ptrTo(4)}, nil, &st); code != 200 {
+		t.Fatalf("set queue = %d", code)
+	}
+	def := "name: adm\nversion: 1\nqueue: q\nsteps: [{name: a, handler: h}, {name: b, handler: h, depends_on: [a]}]"
+	if code := c.do("POST", "/v1/workflows", api.SubmitRequest{Definition: def}, nil, nil); code != 201 {
+		t.Fatalf("first submit = %d", code)
+	}
+	req, _ := http.NewRequestWithContext(t.Context(), "POST", c.url+"/v1/workflows", bytes.NewReader(mustJSON(api.SubmitRequest{Definition: def})))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_ = json.NewDecoder(resp.Body).Decode(&eb)
+	if resp.StatusCode != 429 || resp.Header.Get("Retry-After") == "" || eb.Error.Code != api.CodeQueueFull || eb.Error.Details["queue"] != "q" {
+		t.Fatalf("full queue = %d %v %+v", resp.StatusCode, resp.Header, eb)
+	}
+	var ql api.QueueList
+	c.do("GET", "/v1/queues", nil, nil, &ql)
+	if len(ql.Queues) != 1 || ql.Queues[0].Ready != 1 || ql.Queues[0].Pending != 1 || *ql.Queues[0].Config.MaxDepth != 2 {
+		t.Fatalf("queues = %+v", ql)
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}

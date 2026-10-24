@@ -259,3 +259,76 @@ func short(s *string) string {
 	}
 	return *s
 }
+
+func (c *cli) queues(args []string) error {
+	if len(args) > 0 && args[0] == "set" {
+		var conc, burst, depth int
+		var rate float64
+		var mode string
+		pos, err := parse("queues set", args[1:], func(fs *flag.FlagSet) {
+			fs.IntVar(&conc, "max-concurrency", 0, "running tasks allowed at once")
+			fs.Float64Var(&rate, "rate", 0, "claims per second")
+			fs.IntVar(&burst, "burst", 0, "token bucket size")
+			fs.IntVar(&depth, "max-depth", 0, "backlog limit for admission")
+			fs.StringVar(&mode, "admission", "", "reject or defer")
+		})
+		if err != nil {
+			return err
+		}
+		q, err := one("queues set", pos, "queue name")
+		if err != nil {
+			return err
+		}
+		req := api.QueueConfig{AdmissionMode: mode}
+		if conc > 0 {
+			req.MaxConcurrency = &conc
+		}
+		if rate > 0 {
+			req.RatePerSec = &rate
+		}
+		if burst > 0 {
+			req.Burst = &burst
+		}
+		if depth > 0 {
+			req.MaxDepth = &depth
+		}
+		var resp api.StatusResponse
+		if err := c.api.do(c.ctx, "PUT", "/v1/queues/"+url.PathEscape(q), nil, req, &resp); err != nil {
+			return err
+		}
+		return c.print(resp, func(tw *tabwriter.Writer) { fmt.Fprintln(tw, resp.Status) })
+	}
+	if len(args) > 0 {
+		return usageError("queues takes no arguments, or: queues set QUEUE ...")
+	}
+	var resp api.QueueList
+	if err := c.api.do(c.ctx, "GET", "/v1/queues", nil, nil, &resp); err != nil {
+		return err
+	}
+	return c.print(resp, func(tw *tabwriter.Writer) {
+		fmt.Fprintln(tw, "QUEUE\tPENDING\tREADY\tRUNNING\tRETRY\tDLQ\tCONCURRENCY\tRATE\tDEPTH LIMIT\tADMISSION")
+		for _, q := range resp.Queues {
+			cf := q.Config
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n", q.Queue, q.Pending, q.Ready, q.Running,
+				q.RetryWait, q.DeadLettered, optInt(cf.MaxConcurrency), optRate(cf.RatePerSec, cf.Burst), optInt(cf.MaxDepth), cf.AdmissionMode)
+		}
+	})
+}
+
+func optInt(v *int) string {
+	if v == nil {
+		return "-"
+	}
+	return strconv.Itoa(*v)
+}
+
+func optRate(r *float64, burst *int) string {
+	if r == nil {
+		return "-"
+	}
+	b := 1
+	if burst != nil {
+		b = *burst
+	}
+	return fmt.Sprintf("%g/s (burst %d)", *r, b)
+}
