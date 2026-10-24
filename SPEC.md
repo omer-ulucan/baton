@@ -721,10 +721,16 @@ type Policy interface {
   engine uses. Calls `Primary` with `context.WithTimeout(Timeout)`; on error,
   timeout, or `Confidence < Threshold` it returns `Fallback`'s decision with
   `Fallback` set to the reason. Defaults: threshold `0.5`, timeout `1500ms`
-  for triage, `500ms` for priority (both env-configurable).
+  for both triage and priority (`BATON_TRIAGE_TIMEOUT`,
+  `BATON_PRIORITY_TIMEOUT`). Priority was planned at 500ms, but fp32
+  inference measured ~830ms p50 on a 12-thread CPU, so 500ms would make every
+  classification fall back.
 
-Priority mapping: `low=20, normal=50, high=80, critical=95`. Classification
-applies only to steps that have a `description` and no explicit `priority`.
+Priority mapping: `low=20, high=80, critical=95`; `normal` keeps the
+priority the step inherited. Classification applies only to steps that
+have a `description` and no explicit `priority`, runs concurrently before
+the submission transaction, and is recorded as a `DecisionMade` with
+`kind: priority` after the task's `TaskCreated`.
 
 ### 10.2 Critical-path guarantee
 
@@ -754,7 +760,13 @@ download in phase 7, and non-LFS file hashes pinned then):
 | `onnx/model.onnx_data` | 1,685,175,296 | `afcc11e72b59193fbec6e5dc8b693c9baa81cf66bec53279cefd687b318c3199` |
 | `onnx/model_fp16.onnx` | 4,466,054 | `027403a80579f1546bac9831383c00ab9469a4e7c37aa8f68fdcecd85f8ef29e` |
 | `onnx/model_fp16.onnx_data` | 842,587,136 | `6631bd51ee258787336568fda528ae3534fb5a3e13386558e7502043cbff4828` |
-| `tokenizer.json`, `config.json` | small | pinned in phase 7 |
+| `tokenizer.json` | 3,583,228 | `6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30` |
+| `config.json` | 3,281 | `1a888f1373542026f6e09b4bdfa746eb6ed6cd0713187cf18c5602e92993bb0c` |
+
+(The last two are not LFS objects; their hashes were computed on downloads
+whose git blob ids matched the Hub's tree listing.) The graph's inputs and
+outputs below were read from the file with `tools/parity/inspect_graph.py`
+and match the model card; opset 18.
 
 Graph I/O per the model card (MUST be re-checked by inspecting the graph
 before writing inference code):
@@ -787,22 +799,31 @@ Baton's questions:
 
 `Confidence = max(p)`, `Label = argmax(p)`.
 
-Runtime: `onnxruntime_go` (cgo) with `libonnxruntime.so` (version pinned in
-phase 7); one session per process, created lazily at startup in the
-background; requests are micro-batched (max batch 8, max wait 5ms, padded
+Runtime: `onnxruntime_go` v1.36.0 (cgo) with `libonnxruntime.so` 1.29.0,
+its target C API, installed from Microsoft's release with a checksum; one
+session per process, created lazily at startup in the background; the model
+files are re-verified by SHA-256 on every load; requests are micro-batched (max batch 8, max wait 5ms, padded
 to the longest sequence in the batch). If loading fails (missing or corrupt
 model, checksum mismatch, missing library) the policy reports `unavailable`
 and every decision falls back; the orchestrator keeps running and exposes
 `baton_decision_model_loaded 0`.
 
-Tokenizer: must load `tokenizer.json` and reproduce the reference token ids
-exactly on the parity fixtures. A pure-Go library is required; if none
-matches, work stops for a decision (no cgo tokenizer without approval).
+Tokenizer: `internal/laya/tokenizer`, a pure-Go implementation of exactly
+the components this `tokenizer.json` uses (ADR 0012); no existing pure-Go
+library matched. It must reproduce Hugging Face's ids exactly on a seeded
+differential corpus (3,036 committed cases).
 
-Parity: `tools/parity/` (Python, offline only) writes fixtures to
-`internal/laya/testdata/`: token ids, marker positions, and probabilities.
-Go MUST match ids and markers exactly and probabilities within `1e-4`
-(fp32 model).
+Reference: laya 0.3.21 (the release just before the export), whose
+`build_sequence` and decode were ported; the original checkpoint's
+`rl_agent_config.json` at the reviewed revision `55cf4c4e` matches the
+export's `laya` section.
+
+Parity: `tools/parity/laya_fixtures.py` (Python, offline only) runs laya's
+own `ONNXAgent` on the pinned files and writes `internal/laya/testdata/
+fixtures.json`: token ids, marker positions, raw logits, temperatures and
+unrounded probabilities. Go MUST match ids and markers exactly and
+probabilities within `1e-4` (fp32 model); measured: identical ids and
+markers, max |Δp| 1.1e-16.
 
 ### 10.4 Model distribution
 
@@ -885,19 +906,22 @@ passed explicitly. Principal ones: `BATON_DATABASE_URL`, `BATON_HTTP_ADDR`
 ## 14. Known risks and open questions
 
 1. **Model quality.** The model card reports 36.4% overall accuracy
-   (zero-shot, fp32) on its typed-decisions benchmark. Triage on error
-   messages is out of its training distribution. `LayaPolicy` may well lose to
-   `RulePolicy`; the default policy is `rule` and the eval (phase 10) decides
-   whether `laya` is recommended. EVAL.md will report this honestly either way.
+   (zero-shot, fp32) on its typed-decisions benchmark, and triage on error
+   messages is outside its training distribution. On the ten triage
+   fixtures it picks a sensible label for seven, with confidence between 0.29
+   and 0.51, so at the default threshold most decisions fall back to the
+   rules. The default policy stays `rule`; the eval (phase 10) decides
+   whether `laya` is recommended and EVAL.md reports it either way.
 2. **No int8 export upstream.** Revision `42e2a6e` ships fp32 and fp16 only.
-   fp16 on CPU ONNX Runtime is often *slower* than fp32. An int8 variant
-   would have to be produced by us with ONNX Runtime dynamic quantization in
-   an offline tool and hosted somewhere we control. Decision needed in phase 7.
+   Decided in phase 7: stay on fp32, the only variant that meets the parity
+   bar, rather than produce and host our own quantized artifact. fp16 is
+   selectable (`BATON_LAYA_VARIANT=fp16`) but untested against fixtures.
 3. **Model size and CPU latency.** 1.69 GB fp32 (ModernBERT-large, ~395M
-   parameters). Expect hundreds of milliseconds per triage on CPU; the image
-   grows accordingly. Fallback timeouts are sized for this.
-4. **Tokenizer.** ModernBERT uses a byte-level BPE `tokenizer.json`; a pure-Go
-   implementation with exact parity is not guaranteed to exist. Phase 7 stops
-   for a decision if none matches.
+   parameters); ~1.4 GB RSS per replica once loaded; ~830ms p50 / 870ms p99
+   per triage on a 12-thread CPU. Fallback timeouts are sized for this, and
+   the compose stack enables Laya only through an override file.
+4. **Tokenizer.** Resolved: own pure-Go implementation with exact parity on
+   the committed corpus and on a 20,036-case second-seed corpus (ADR 0012).
+   The residual risk is input the corpora do not reach.
 5. **Rate limiter state** is leader-memory only (9.1).
 6. **Single writer** caps write throughput at one replica (ADR 0003).

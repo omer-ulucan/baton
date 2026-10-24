@@ -312,7 +312,7 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 		}
 		changes := []state.Change{
 			{TaskID: t.ID, Payload: state.TaskFailed{AttemptID: r.AttemptID, ErrorClass: f.Type, Message: f.Message, StackDigest: digest([]byte(f.Stack))}},
-			{TaskID: t.ID, Payload: decisionEvent(d, r.AttemptID, latency)},
+			{TaskID: t.ID, Payload: decisionEvent(decision.KindTriage, d, &r.AttemptID, latency)},
 		}
 		var disposition state.Change
 		disposition, next = e.dispose(def, t, d.Label, tx.Now())
@@ -381,9 +381,9 @@ func (e *Engine) triage(ctx context.Context, req decision.Request) (decision.Dec
 	return d, time.Since(start)
 }
 
-func decisionEvent(d decision.Decision, attempt uuid.UUID, latency time.Duration) state.DecisionMade {
+func decisionEvent(kind decision.Kind, d decision.Decision, attempt *uuid.UUID, latency time.Duration) state.DecisionMade {
 	ev := state.DecisionMade{
-		Kind: string(decision.KindTriage), AttemptID: &attempt, InputHash: d.InputHash, Label: d.Label,
+		Kind: string(kind), AttemptID: attempt, InputHash: d.InputHash, Label: d.Label,
 		Confidence: d.Confidence, Policy: d.Policy, ModelRevision: d.ModelRevision, Fallback: d.Fallback,
 		LatencyMS: latency.Milliseconds(),
 	}

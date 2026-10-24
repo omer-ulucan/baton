@@ -489,3 +489,37 @@ func TestConcurrentFirstSubmissionsOfOneKey(t *testing.T) {
 		t.Fatalf("%d workflows", n)
 	}
 }
+
+func TestPriorityClassificationAtSubmission(t *testing.T) {
+	e := wfEnv(t, nil)
+	wf := e.submit(`
+name: prio
+version: 1
+priority: 40
+steps:
+  - {name: fix, handler: h, description: "Restore checkout after the payment provider outage"}
+  - {name: digest, handler: h, description: "Send the weekly newsletter digest"}
+  - {name: plain, handler: h, description: "Resize product images"}
+  - {name: pinned, handler: h, priority: 10, description: "Restore checkout after the outage"}
+  - {name: bare, handler: h}
+`, "")
+	want := map[string]int{"fix": 95, "digest": 20, "plain": 40, "pinned": 10, "bare": 40}
+	byID := map[uuid.UUID]string{}
+	for _, tk := range e.workflow(wf).Tasks {
+		byID[tk.ID] = tk.StepName
+		if tk.Priority != want[tk.StepName] {
+			t.Errorf("%s priority = %d, want %d", tk.StepName, tk.Priority, want[tk.StepName])
+		}
+	}
+	events, _ := e.store.Events(t.Context(), wf)
+	decided := map[string]string{}
+	for _, ev := range events {
+		if d, ok := ev.Payload.(state.DecisionMade); ok && d.Kind == "priority" {
+			decided[byID[ev.TaskID]] = d.Label
+		}
+	}
+	if len(decided) != 3 || decided["fix"] != "critical" || decided["digest"] != "low" || decided["plain"] != "normal" {
+		t.Fatalf("priority decisions = %v (explicit and undescribed steps must not be classified)", decided)
+	}
+	e.verifyReplay()
+}

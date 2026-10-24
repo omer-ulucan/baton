@@ -26,7 +26,16 @@ type Orchestrator struct {
 	AgingSeconds      int
 	DecisionPolicy    string // "rule" | "laya"
 	DecisionThreshold float64
+	TriageTimeout     time.Duration
+	PriorityTimeout   time.Duration
 	EscalationWebhook string // receives escalation messages; empty disables them
+
+	// Laya (BATON_DECISION_POLICY=laya).
+	ModelDir        string // pinned model files; "" means the default cache
+	LayaVariant     string // fp32 | fp16
+	LayaMaxInflight int    // concurrent ONNX runs
+	ONNXRuntimeLib  string // path to libonnxruntime.so
+	ModelDownload   bool   // fetch missing model files on start
 }
 
 // Worker is the configuration of a baton-worker process.
@@ -55,7 +64,14 @@ func LoadOrchestrator(getenv func(string) string, hostname string) (Orchestrator
 		AgingSeconds:      r.positiveInt("BATON_AGING_SECONDS", 30),
 		DecisionPolicy:    r.str("BATON_DECISION_POLICY", "rule"),
 		DecisionThreshold: r.float("BATON_DECISION_THRESHOLD", 0.5),
+		TriageTimeout:     r.duration("BATON_TRIAGE_TIMEOUT", 1500*time.Millisecond),
+		PriorityTimeout:   r.duration("BATON_PRIORITY_TIMEOUT", 1500*time.Millisecond),
 		EscalationWebhook: r.str("BATON_ESCALATION_WEBHOOK", ""),
+		ModelDir:          r.str("BATON_MODEL_DIR", ""),
+		LayaVariant:       r.str("BATON_LAYA_VARIANT", "fp32"),
+		LayaMaxInflight:   r.positiveInt("BATON_LAYA_MAX_INFLIGHT", 2),
+		ONNXRuntimeLib:    r.str("ONNXRUNTIME_LIB_PATH", "/usr/local/lib/libonnxruntime.so"),
+		ModelDownload:     r.boolean("BATON_MODEL_DOWNLOAD", true),
 	}
 	c.AdvertiseAddr = r.str("BATON_ADVERTISE_ADDR", defaultAdvertise(c.ReplicaID, c.HTTPAddr))
 
@@ -70,6 +86,9 @@ func LoadOrchestrator(getenv func(string) string, hostname string) (Orchestrator
 	}
 	if c.DecisionPolicy != "rule" && c.DecisionPolicy != "laya" {
 		r.fail("BATON_DECISION_POLICY must be rule or laya, got %q", c.DecisionPolicy)
+	}
+	if c.LayaVariant != "fp32" && c.LayaVariant != "fp16" {
+		r.fail("BATON_LAYA_VARIANT must be fp32 or fp16, got %q", c.LayaVariant)
 	}
 	if c.DecisionThreshold < 0 || c.DecisionThreshold > 1 {
 		r.fail("BATON_DECISION_THRESHOLD must be in [0,1], got %v", c.DecisionThreshold)

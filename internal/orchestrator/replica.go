@@ -16,7 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/omer-ulucan/baton/internal/config"
+	"github.com/omer-ulucan/baton/internal/decision"
 	"github.com/omer-ulucan/baton/internal/engine"
+	"github.com/omer-ulucan/baton/internal/laya"
+	"github.com/omer-ulucan/baton/internal/laya/model"
 	"github.com/omer-ulucan/baton/internal/leader"
 	"github.com/omer-ulucan/baton/internal/server"
 	"github.com/omer-ulucan/baton/internal/store"
@@ -42,6 +45,7 @@ type Replica struct {
 	store   *store.Store
 	elector *leader.Elector
 	engine  *engine.Engine
+	loader  *laya.Loader // nil with the rule policy
 	http    *http.Server
 
 	killOnce sync.Once
@@ -57,10 +61,16 @@ func New(o Options) *Replica {
 	log = log.With("replica", o.Config.ReplicaID)
 	st := store.New(o.Pool)
 	el := leader.New(st, leader.Config{ID: o.Config.ReplicaID, Addr: o.Config.AdvertiseAddr, TTL: o.Config.LeaderTTL}, log)
+	policy, loader := decisionPolicy(o.Config, log)
 	eo := engine.Options{
 		Store: st, Log: log, Fence: el.Fence, EscalationURL: o.Config.EscalationWebhook,
 		OnFenced: func() { el.Demote("write rejected by fencing") },
-		Config:   engine.Config{LeaseTTL: o.Config.LeaseTTL, HeartbeatInterval: o.Config.HeartbeatInterval},
+		Policy:   policy,
+		Config: engine.Config{
+			LeaseTTL: o.Config.LeaseTTL, HeartbeatInterval: o.Config.HeartbeatInterval,
+			// An outer guard only: the fallback policy enforces the real deadline.
+			DecisionTimeout: o.Config.TriageTimeout + time.Second,
+		},
 	}
 	if o.Engine != nil {
 		o.Engine(&eo)
@@ -71,7 +81,7 @@ func New(o Options) *Replica {
 		Leadership: el, ReplicaID: o.Config.ReplicaID, Log: log,
 	})
 	return &Replica{
-		cfg: o.Config, pool: o.Pool, ln: o.Listener, log: log, store: st, elector: el, engine: eng,
+		cfg: o.Config, pool: o.Pool, ln: o.Listener, log: log, store: st, elector: el, engine: eng, loader: loader,
 		http:   &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
 		killed: make(chan struct{}),
 	}
@@ -85,6 +95,11 @@ func (r *Replica) Run(ctx context.Context) error {
 	defer stopSrv()
 	r.http.BaseContext = func(net.Listener) context.Context { return srvCtx }
 
+	if r.loader != nil {
+		// Every replica loads the model: any of them may become leader.
+		go r.loader.Run(srvCtx)
+		defer func() { _ = r.loader.Close() }()
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- r.http.Serve(r.ln) }()
 	r.log.Info("listening", "addr", r.ln.Addr().String(), "advertise", r.cfg.AdvertiseAddr)
@@ -129,6 +144,34 @@ func (r *Replica) Run(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// decisionPolicy builds the policy the engine uses: always the fallback
+// policy, with Laya as primary when configured (SPEC 10.1).
+func decisionPolicy(c config.Orchestrator, log *slog.Logger) (decision.Policy, *laya.Loader) {
+	var primary decision.Policy = decision.RulePolicy{}
+	var loader *laya.Loader
+	if c.DecisionPolicy == "laya" {
+		dir := c.ModelDir
+		if dir == "" {
+			var err error
+			if dir, err = model.DefaultDir(); err != nil {
+				log.Error("no model cache dir; decisions use the rule policy", "err", err)
+			}
+		}
+		lp := &laya.Policy{}
+		loader = laya.NewLoader(laya.LoaderConfig{
+			Session: laya.SessionConfig{
+				LibPath: c.ONNXRuntimeLib, ModelDir: dir, Variant: model.Variant(c.LayaVariant), MaxInflight: c.LayaMaxInflight,
+			},
+			Download: c.ModelDownload, Log: log,
+		}, lp)
+		primary = lp
+	}
+	return decision.FallbackPolicy{
+		Primary: primary, Fallback: decision.RulePolicy{}, Threshold: c.DecisionThreshold,
+		Timeouts: map[decision.Kind]time.Duration{decision.KindTriage: c.TriageTimeout, decision.KindPriority: c.PriorityTimeout},
+	}, loader
 }
 
 // Kill stops the replica abruptly, like a crash: connections are cut and

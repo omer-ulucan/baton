@@ -1,0 +1,6 @@
+# Offline parity tooling only; never a runtime dependency of Baton.
+onnx==1.23.2
+tokenizers==0.23.3
+laya==0.3.21
+onnxruntime==1.29.0
+# torch (CPU) is pulled in by laya; install from https://download.pytorch.org/whl/cpu

@@ -1,6 +1,6 @@
 # 0008. Laya model artifact: pinned revision, checksums, fp32 default
 
-Status: Accepted (int8 question open, see below)
+Status: Accepted (int8 question resolved in phase 7: stay on fp32)
 
 ## Context
 
@@ -34,15 +34,22 @@ decisions recorded with the revision that made them.
 
 - Upgrading the model is a code change (new revision and hashes), reviewed
   like any other.
-- The orchestrator image is about 1.8 GB larger.
+- The `baton-laya` image is about 1.7 GB larger than `baton`, which fetches
+  the model on first start instead; the plain image carries only
+  libonnxruntime (28 MB).
 
-## Open question: int8
+## int8 (resolved)
 
-The pinned revision ships no int8 export. Options, decided in phase 7 after
-measuring fp32 latency:
-1. Stay on fp32 (simplest, parity holds).
-2. Produce an int8 graph offline with ONNX Runtime dynamic quantization
-   (tool under `tools/`, never at runtime), host it under our own Hugging
-   Face repo with a pinned revision and checksum, and run the eval on it.
-   Quantization changes outputs, so it would get its own accuracy numbers in
-   EVAL.md rather than the 1e-4 parity bar.
+The pinned revision ships no int8 export. Options were to stay on fp32, or
+to quantize offline with ONNX Runtime and host the result ourselves.
+Decision: stay on fp32. It is the only variant that meets the 1e-4 parity
+bar against laya, its measured CPU latency (~830ms p50 per triage) fits the
+1.5s decision timeout, and hosting a derived artifact would add a
+supply-chain surface for a model whose accuracy on triage is still unproven
+(SPEC 14). Revisit if the eval shows Laya is worth running and latency
+becomes the limit.
+
+The non-LFS files are pinned too: `tokenizer.json`
+`6c8aaa9a…3c08d30`, `config.json` `1a888f13…2993bb0c` (full hashes in
+`internal/laya/model`), computed on downloads whose git blob ids matched
+the Hub.

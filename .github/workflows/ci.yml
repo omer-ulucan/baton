@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+env:
+  ORT_VERSION: "1.29.0"
+  ORT_SHA256: c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba
+  MODEL_REVISION: 42e2a6e3b3708c8ff5f61f4aa75c314b1449199b
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -29,13 +34,43 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
+      # Tokenizer and input-builder parity need only the small, verified
+      # model files; inference parity runs in the laya job.
+      - run: go run ./cmd/baton model fetch --small
       # Integration tests (testcontainers-go) use the runner's Docker daemon.
       - run: go test -race ./...
+
+  laya:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/baton/models/${{ env.MODEL_REVISION }}
+            ~/.cache/baton/onnxruntime/${{ env.ORT_VERSION }}
+          key: laya-${{ env.MODEL_REVISION }}-ort-${{ env.ORT_VERSION }}
+      - name: ONNX Runtime
+        run: |
+          d=~/.cache/baton/onnxruntime/$ORT_VERSION
+          if [ ! -f $d/lib/libonnxruntime.so ]; then
+            mkdir -p $d
+            curl -sfL -o /tmp/ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-x64-$ORT_VERSION.tgz
+            echo "$ORT_SHA256  /tmp/ort.tgz" | sha256sum -c -
+            tar -xzf /tmp/ort.tgz -C $d --strip-components=1
+          fi
+      # Verifies cached files too; downloads only what is missing or wrong.
+      - run: go run ./cmd/baton model fetch
+      - run: ONNXRUNTIME_LIB_PATH=$HOME/.cache/baton/onnxruntime/$ORT_VERSION/lib/libonnxruntime.so go test -race -count=1 ./internal/laya/...
 
   images:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - run: docker compose config -q
+      - run: docker compose -f docker-compose.yml -f docker-compose.laya.yml config -q
       - run: docker build --target baton -t baton:ci .
       - run: docker build --target baton-worker -t baton-worker:ci .
