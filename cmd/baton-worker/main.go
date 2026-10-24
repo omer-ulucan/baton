@@ -40,7 +40,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("config: %w", err)
 	}
 	// Claims long-poll for up to 20s; the client timeout must exceed it.
-	client := worker.NewClient(cfg.OrchestratorAddr, &http.Client{Timeout: 45 * time.Second})
+	client := worker.NewClient(cfg.OrchestratorAddrs, &http.Client{Timeout: 45 * time.Second})
 	r := worker.NewRunner(client, builtin.Handlers(), worker.Config{
 		ID:           cfg.WorkerID,
 		Queues:       cfg.Queues,

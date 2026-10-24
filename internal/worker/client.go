@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/omer-ulucan/baton/internal/protocol"
 )
@@ -33,19 +34,27 @@ func IsCode(err error, code string) bool {
 	return errors.As(err, &ae) && ae.Code == code
 }
 
-// Client calls the worker protocol endpoints.
+// Client calls the worker protocol endpoints. It knows every replica and
+// moves to the next one when the current one is unreachable or answers
+// 503 (no leader known yet, or it was just fenced); any replica can serve
+// any request because followers forward writes to the leader.
 type Client struct {
-	base string
-	http *http.Client
+	bases []string
+	cur   atomic.Int64
+	http  *http.Client
 }
 
-// NewClient returns a client for the orchestrator at base (e.g.
+// NewClient returns a client for the given replicas (e.g.
 // http://baton-1:8080). hc may be nil for http.DefaultClient.
-func NewClient(base string, hc *http.Client) *Client {
+func NewClient(bases []string, hc *http.Client) *Client {
 	if hc == nil {
 		hc = http.DefaultClient
 	}
-	return &Client{base: strings.TrimRight(base, "/"), http: hc}
+	c := &Client{http: hc}
+	for _, b := range bases {
+		c.bases = append(c.bases, strings.TrimRight(b, "/"))
+	}
+	return c
 }
 
 func (c *Client) Register(ctx context.Context, req protocol.RegisterRequest) (protocol.RegisterResponse, error) {
@@ -82,7 +91,22 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+	for range len(c.bases) {
+		i := c.cur.Load()
+		err = c.postTo(ctx, c.bases[i%int64(len(c.bases))], path, body, out)
+		var ae *APIError
+		retryable := err != nil && ctx.Err() == nil &&
+			(!errors.As(err, &ae) || ae.Status == http.StatusServiceUnavailable)
+		if !retryable {
+			return err
+		}
+		c.cur.CompareAndSwap(i, i+1) // next replica, unless another call already moved
+	}
+	return err
+}
+
+func (c *Client) postTo(ctx context.Context, base, path string, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

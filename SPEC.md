@@ -244,13 +244,18 @@ database clock (`clock_timestamp()` where it matters mid-transaction); Go
 process clocks are never used for lease or fencing decisions.
 
 ```sql
--- Leader election (section 6.1)
+-- Leader election (section 6.1). Two single-row tables so that renewals
+-- (leader_lease) never contend with the FOR SHARE fence checks of write
+-- transactions (leader_fence), which only a takeover updates.
 CREATE TABLE leader_lease (
+  name        text PRIMARY KEY,                 -- always 'leader'
+  holder_id   text,                              -- replica id, NULL if never held
+  holder_addr text,                              -- advertised http address of holder
+  expires_at  timestamptz NOT NULL DEFAULT '-infinity'
+);
+CREATE TABLE leader_fence (
   name          text PRIMARY KEY,               -- always 'leader'
-  holder_id     text,                            -- replica id, NULL if never held
-  holder_addr   text,                            -- advertised http address of holder
-  fencing_token bigint NOT NULL DEFAULT 0,
-  expires_at    timestamptz NOT NULL DEFAULT '-infinity'
+  fencing_token bigint NOT NULL DEFAULT 0
 );
 
 -- Immutable definitions, deduplicated by content hash
@@ -434,21 +439,16 @@ Parameters: `BATON_LEADER_TTL` (default 10s), renew every TTL/3, a replica
 that fails to renew within TTL/2 of its last success MUST stop all leader
 loops and stop accepting writes before its lease could expire.
 
-Acquire or renew (one statement, DB clock):
+Acquire or renew (one transaction, DB clock): update `leader_lease` where
+`holder_id = $me OR expires_at <= clock_timestamp()`, setting holder,
+address and `expires_at = clock_timestamp() + $ttl`. If the lease was this
+replica's and still live, it is a renewal: the token is read, not changed,
+and `leader_fence` is not touched, so a renewal never waits behind write
+traffic. Otherwise it is a new term: `UPDATE leader_fence SET
+fencing_token = fencing_token + 1`, which waits for every in-flight
+transaction of the previous leader (they hold the fence `FOR SHARE`).
 
-```sql
-UPDATE leader_lease
-   SET holder_id     = $me,
-       holder_addr   = $addr,
-       fencing_token = CASE WHEN holder_id = $me AND expires_at > clock_timestamp()
-                            THEN fencing_token ELSE fencing_token + 1 END,
-       expires_at    = clock_timestamp() + $ttl
- WHERE name = 'leader'
-   AND (holder_id = $me OR expires_at <= clock_timestamp())
-RETURNING fencing_token;
-```
-
-No row returned means another replica leads. A replica that renews after its
+No row updated means another replica leads. A replica that renews after its
 own lease expired gets a new token, and MUST treat that as a new term
 (restart loops, rebuild in-memory caches). Voluntary step-down on SIGTERM
 sets `expires_at = '-infinity'` for a fast handover.
@@ -460,23 +460,23 @@ Every insert into `workflow_events` carries `fencing_token`. A
 the lease is unexpired:
 
 ```sql
-SELECT fencing_token, expires_at INTO cur_token, cur_exp
-  FROM leader_lease WHERE name = 'leader' FOR SHARE;
+SELECT fencing_token INTO cur_token FROM leader_fence WHERE name = 'leader' FOR SHARE;
+SELECT expires_at    INTO cur_exp   FROM leader_lease WHERE name = 'leader';
 IF NEW.fencing_token <> cur_token OR cur_exp <= clock_timestamp() THEN
   RAISE EXCEPTION 'stale fencing token % (current %)', NEW.fencing_token, cur_token
     USING ERRCODE = 'BT001';
 END IF;
 ```
 
-`FOR SHARE` on the lease row conflicts with the takeover `UPDATE`, so a
-takeover waits for in-flight leader transactions to finish and, once it
-commits, every later insert from the old leader fails. Because every state
-change appends an event in the same transaction (5.1), **no projection,
-outbox or lease write by a stale leader can commit**. Writes to
-`task_leases` and `outbox` happen only in transactions that also insert an
-event, except heartbeat extension, which uses
-`UPDATE task_leases ... WHERE ... AND (SELECT fencing_token FROM leader_lease FOR SHARE) = $token`
-for the same guarantee. Error `BT001` makes the replica step down
+`FOR SHARE` on the fence row conflicts with the takeover's token
+`UPDATE`, so a takeover waits for in-flight leader transactions to finish
+and, once it commits, every later insert from the old leader fails.
+Because every state change appends an event in the same transaction (5.1),
+no projection write by a stale leader can commit. In addition, every write
+transaction begins by locking the fence row `FOR SHARE` and checking the
+token and lease expiry, so writes that append no event (heartbeat lease
+extension, worker registry, outbox bookkeeping) are fenced the same way.
+A rejection (`BT001` or the check) makes the replica step down
 immediately.
 
 ### 6.3 Single writer

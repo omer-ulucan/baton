@@ -124,7 +124,7 @@ func TestWorkerDefaultsAndQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadWorker: %v", err)
 	}
-	if c.OrchestratorAddr != "http://localhost:8080" || c.WorkerID != "w-host" {
+	if len(c.OrchestratorAddrs) != 1 || c.OrchestratorAddrs[0] != "http://localhost:8080" || c.WorkerID != "w-host" {
 		t.Errorf("defaults: %+v", c)
 	}
 	if strings.Join(c.Queues, "|") != "default|payments" {
@@ -132,6 +132,16 @@ func TestWorkerDefaultsAndQueues(t *testing.T) {
 	}
 	if c.Concurrency != 4 || c.DrainTimeout != 25*time.Second {
 		t.Errorf("defaults: %+v", c)
+	}
+}
+
+func TestWorkerAddressList(t *testing.T) {
+	c, err := LoadWorker(env(map[string]string{"BATON_ADDR": "http://a:8080, http://b:8080"}), "w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(c.OrchestratorAddrs, "|") != "http://a:8080|http://b:8080" {
+		t.Fatalf("addrs = %q", c.OrchestratorAddrs)
 	}
 }
 

@@ -12,13 +12,15 @@ can wake up after its lease expired and still issue writes.
 
 ## Decision
 
-A single `leader_lease` row holds `holder_id`, `fencing_token` and
-`expires_at`. Replicas acquire or renew with one conditional `UPDATE` using
-the database clock; the token increments whenever the holder changes or a
-lease is re-acquired after expiry. Every event insert carries the writer's
-token, and a `BEFORE INSERT` trigger on `workflow_events` takes `FOR SHARE`
-on the lease row and rejects the insert (SQLSTATE `BT001`) unless the token
-is current and unexpired. Since every state-changing transaction inserts an
+A `leader_lease` row holds `holder_id` and `expires_at`; a separate
+`leader_fence` row holds `fencing_token`. Replicas acquire or renew with a
+conditional `UPDATE` of the lease using the database clock; the token
+increments (an `UPDATE` of the fence row) only when the holder changes or a
+lease is re-acquired after expiry. Every write transaction locks the fence
+row `FOR SHARE` and checks the token, and every event insert carries the
+token, where a `BEFORE INSERT` trigger on `workflow_events` does the same
+check and rejects the insert (SQLSTATE `BT001`) unless the token is current
+and the lease unexpired. Since every state-changing transaction inserts an
 event, a stale leader cannot commit anything. A leader that cannot renew
 within TTL/2 steps down on its own before its lease can expire.
 
@@ -31,9 +33,14 @@ within TTL/2 steps down on its own before its lease can expire.
 - Failover time is bounded by the lease TTL (default 10s) plus one renew period.
 - Leader election availability equals Postgres availability, which we
   already depend on (ADR 0001); no new failure domain.
-- Every event insert does one extra indexed row read with a share lock on a
-  hot row. Measured in phase 10; acceptable because all writes already go
-  through one leader (ADR 0003).
+- Every write transaction takes a share lock on one hot row. Shared locks
+  do not conflict with each other; only a takeover waits on them.
+- Lease and fence are separate rows on purpose. In a first version they
+  were one row, and the failover test showed the new leader stepping down
+  under load: each renewal `UPDATE` had to wait for all in-flight writes
+  holding `FOR SHARE`, and a steady stream of share lockers can starve it
+  past the self-fencing deadline. With the split, renewals never touch the
+  locked row, and the test asserts the new leader is promoted exactly once.
 
 ## Alternatives considered
 

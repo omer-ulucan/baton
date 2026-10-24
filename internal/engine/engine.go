@@ -70,6 +70,9 @@ type Options struct {
 	EscalationURL string
 	// HTTPClient delivers outbox messages; defaults to a 5s-timeout client.
 	HTTPClient *http.Client
+	// OnFenced is called when the database rejects a write as coming from
+	// a stale leader; the replica must step down at once (SPEC 6.2).
+	OnFenced func()
 }
 
 // Engine implements the worker protocol and the leader's timer loops.
@@ -86,6 +89,7 @@ type Engine struct {
 	defs        *definitions
 	escalateURL string
 	http        *http.Client
+	onFenced    func()
 }
 
 // New builds an Engine, filling defaults.
@@ -109,7 +113,7 @@ func New(o Options) *Engine {
 		store: o.Store, log: o.Log, cfg: c, fence: o.Fence, policy: o.Policy,
 		retryPolicy: o.RetryPolicy, timeout: o.Timeout, rand: o.Rand, ready: newNotifier(),
 		defs:        &definitions{store: o.Store, byID: map[uuid.UUID]*workflow.Definition{}},
-		escalateURL: o.EscalationURL, http: o.HTTPClient,
+		escalateURL: o.EscalationURL, http: o.HTTPClient, onFenced: o.OnFenced,
 	}
 	if e.http == nil {
 		e.http = &http.Client{Timeout: 5 * time.Second}
@@ -158,6 +162,15 @@ func (e *Engine) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// inTx runs a fenced write transaction and reports fencing rejections.
+func (e *Engine) inTx(ctx context.Context, fn func(*store.Tx) error) error {
+	err := e.store.InTx(ctx, e.fence(), fn)
+	if errors.Is(err, store.ErrFenced) && e.onFenced != nil {
+		e.onFenced()
+	}
+	return err
 }
 
 func orDefault(d, def time.Duration) time.Duration {

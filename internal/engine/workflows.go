@@ -62,7 +62,7 @@ func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) 
 	}
 
 	var status state.WorkflowStatus
-	err = e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err = e.inTx(ctx, func(tx *store.Tx) error {
 		defID, err := tx.InsertDefinition(ctx, def.Name, def.Version, parsed.SHA256[:], parsed.Spec)
 		if err != nil {
 			return err
@@ -216,7 +216,7 @@ func (e *Engine) RetryDLQ(ctx context.Context, taskID uuid.UUID, by string) erro
 }
 
 func (e *Engine) updateWorkflow(ctx context.Context, wfID uuid.UUID, decide func(*state.Snapshot) ([]state.Change, error)) error {
-	return e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	return e.inTx(ctx, func(tx *store.Tx) error {
 		snap, err := tx.Load(ctx, wfID)
 		if err != nil {
 			return err

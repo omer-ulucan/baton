@@ -29,7 +29,7 @@ func (e *Engine) Register(ctx context.Context, w Worker) error {
 	if w.ID == "" || len(w.Queues) == 0 || len(w.Handlers) == 0 {
 		return fmt.Errorf("%w: worker id, queues and handlers are required", ErrInvalid)
 	}
-	return e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	return e.inTx(ctx, func(tx *store.Tx) error {
 		return tx.UpsertWorker(ctx, clean(w.ID), w.Queues, w.Handlers, clean(w.Version))
 	})
 }
@@ -93,7 +93,7 @@ func (e *Engine) Claim(ctx context.Context, req ClaimRequest) ([]Assignment, err
 
 func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment, error) {
 	var out []Assignment
-	err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err := e.inTx(ctx, func(tx *store.Tx) error {
 		out = out[:0]
 		queues, handlers, ok, err := tx.Worker(ctx, req.WorkerID)
 		if err != nil {
@@ -175,7 +175,7 @@ type HeartbeatResult struct {
 // returned as revoked with a reason; the worker must abandon them.
 func (e *Engine) Heartbeat(ctx context.Context, workerID string, attempts []uuid.UUID) (HeartbeatResult, error) {
 	res := HeartbeatResult{Extended: map[uuid.UUID]time.Time{}, Revoked: map[uuid.UUID]string{}}
-	err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err := e.inTx(ctx, func(tx *store.Tx) error {
 		ok, err := tx.TouchWorker(ctx, workerID)
 		if err != nil {
 			return err
@@ -226,7 +226,7 @@ func (e *Engine) Complete(ctx context.Context, r Result, output json.RawMessage)
 	if err != nil {
 		return err
 	}
-	err = e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err = e.inTx(ctx, func(tx *store.Tx) error {
 		snap, err := tx.Load(ctx, wf)
 		if err != nil {
 			return err
@@ -294,7 +294,7 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 	})
 
 	var next Next
-	err = e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err = e.inTx(ctx, func(tx *store.Tx) error {
 		snap, err := tx.Load(ctx, wf)
 		if err != nil {
 			return err
@@ -404,7 +404,7 @@ func nextOf(t *state.Task) Next {
 // shutdown, SPEC 8.2). Attempts the worker no longer owns are ignored.
 func (e *Engine) Release(ctx context.Context, workerID string, attempts []uuid.UUID) error {
 	var leases map[uuid.UUID]store.Lease
-	err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err := e.inTx(ctx, func(tx *store.Tx) error {
 		var err error
 		leases, err = tx.Leases(ctx, attempts)
 		return err
@@ -417,7 +417,7 @@ func (e *Engine) Release(ctx context.Context, workerID string, attempts []uuid.U
 		if l.WorkerID != workerID {
 			continue
 		}
-		err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+		err := e.inTx(ctx, func(tx *store.Tx) error {
 			snap, err := tx.Load(ctx, l.WorkflowID)
 			if err != nil {
 				return err

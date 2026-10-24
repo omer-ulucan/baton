@@ -14,6 +14,7 @@ import (
 	"github.com/omer-ulucan/baton/internal/engine"
 	"github.com/omer-ulucan/baton/internal/protocol"
 	"github.com/omer-ulucan/baton/internal/state"
+	"github.com/omer-ulucan/baton/internal/store"
 )
 
 // WorkerProtocol is the engine as seen by the worker endpoints.
@@ -29,14 +30,16 @@ type WorkerProtocol interface {
 
 const maxBody = 1 << 20
 
-func registerWorkerRoutes(mux *http.ServeMux, wp WorkerProtocol, log *slog.Logger) {
+// Every worker protocol call writes (heartbeats extend leases, claims grant
+// them), so all of them run on the leader.
+func registerWorkerRoutes(mux *http.ServeMux, wp WorkerProtocol, fw *forwarder, log *slog.Logger) {
 	h := workerHandlers{wp: wp, log: log}
-	mux.HandleFunc("POST "+protocol.PathRegister, h.register)
-	mux.HandleFunc("POST "+protocol.PathClaim, h.claim)
-	mux.HandleFunc("POST "+protocol.PathHeartbeat, h.heartbeat)
-	mux.HandleFunc("POST "+protocol.PathComplete, h.complete)
-	mux.HandleFunc("POST "+protocol.PathFail, h.failTask)
-	mux.HandleFunc("POST "+protocol.PathRelease, h.release)
+	mux.Handle("POST "+protocol.PathRegister, fw.write(h.register))
+	mux.Handle("POST "+protocol.PathClaim, fw.write(h.claim))
+	mux.Handle("POST "+protocol.PathHeartbeat, fw.write(h.heartbeat))
+	mux.Handle("POST "+protocol.PathComplete, fw.write(h.complete))
+	mux.Handle("POST "+protocol.PathFail, fw.write(h.failTask))
+	mux.Handle("POST "+protocol.PathRelease, fw.write(h.release))
 }
 
 type workerHandlers struct {
@@ -123,6 +126,10 @@ func (h workerHandlers) complete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h workerHandlers) respondErr(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrFenced) {
+		notLeader(w)
+		return
+	}
 	code, status := errorCode(err)
 	if status == http.StatusInternalServerError {
 		h.log.ErrorContext(r.Context(), "worker protocol", "path", r.URL.Path, "err", err)

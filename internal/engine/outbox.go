@@ -57,7 +57,7 @@ func (e *Engine) queueEscalation(ctx context.Context, tx *store.Tx, t *state.Tas
 // same time. It returns the number delivered.
 func (e *Engine) RelayOutbox(ctx context.Context) (int, error) {
 	sent := 0
-	err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err := e.inTx(ctx, func(tx *store.Tx) error {
 		sent = 0
 		msgs, err := tx.DueOutbox(ctx, outboxBatch)
 		if err != nil {

@@ -31,11 +31,12 @@ type Orchestrator struct {
 
 // Worker is the configuration of a baton-worker process.
 type Worker struct {
-	OrchestratorAddr string
-	WorkerID         string
-	Queues           []string
-	Concurrency      int
-	DrainTimeout     time.Duration
+	// OrchestratorAddrs lists replicas; the client fails over between them.
+	OrchestratorAddrs []string
+	WorkerID          string
+	Queues            []string
+	Concurrency       int
+	DrainTimeout      time.Duration
 }
 
 // LoadOrchestrator reads orchestrator settings. hostname is the default
@@ -80,11 +81,14 @@ func LoadOrchestrator(getenv func(string) string, hostname string) (Orchestrator
 func LoadWorker(getenv func(string) string, hostname string) (Worker, error) {
 	r := reader{getenv: getenv}
 	c := Worker{
-		OrchestratorAddr: r.str("BATON_ADDR", "http://localhost:8080"),
-		WorkerID:         r.str("BATON_WORKER_ID", hostname),
-		Queues:           splitList(r.str("BATON_WORKER_QUEUES", "default")),
-		Concurrency:      r.positiveInt("BATON_WORKER_CONCURRENCY", 4),
-		DrainTimeout:     r.duration("BATON_WORKER_DRAIN_TIMEOUT", 25*time.Second),
+		OrchestratorAddrs: splitList(r.str("BATON_ADDR", "http://localhost:8080")),
+		WorkerID:          r.str("BATON_WORKER_ID", hostname),
+		Queues:            splitList(r.str("BATON_WORKER_QUEUES", "default")),
+		Concurrency:       r.positiveInt("BATON_WORKER_CONCURRENCY", 4),
+		DrainTimeout:      r.duration("BATON_WORKER_DRAIN_TIMEOUT", 25*time.Second),
+	}
+	if len(c.OrchestratorAddrs) == 0 {
+		r.fail("BATON_ADDR must name at least one orchestrator")
 	}
 	if c.WorkerID == "" {
 		r.fail("BATON_WORKER_ID is required when the hostname is unknown")
