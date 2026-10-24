@@ -117,7 +117,13 @@ func (r *Replica) Run(ctx context.Context) error {
 	defer cancel()
 	stopSrv() // end long polls so Shutdown does not wait for them
 	if err := r.http.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("shutdown: %w", err)
+		}
+		// Connections that never sent a request count as active for up
+		// to 5s in net/http; past the drain deadline, cut what is left.
+		r.log.Warn("drain deadline passed; closing remaining connections")
+		_ = r.http.Close()
 	}
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		return err
