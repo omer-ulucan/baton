@@ -18,6 +18,7 @@ type Lease struct {
 	WorkerID   string
 	LeaseUntil time.Time
 	Revoked    bool
+	ClaimedAt  time.Time
 }
 
 // TaskRef locates a task.
@@ -101,8 +102,8 @@ func (t *Tx) ClaimCandidates(ctx context.Context, queues, handlers []string, lim
 // InsertLease grants a lease for a claimed attempt, valid for ttl from now.
 func (t *Tx) InsertLease(ctx context.Context, ref TaskRef, attemptID uuid.UUID, workerID string, ttl time.Duration) (time.Time, error) {
 	until := t.now.Add(ttl)
-	_, err := t.tx.Exec(ctx, `INSERT INTO task_leases (task_id, attempt_id, worker_id, lease_until)
-		VALUES ($1, $2, $3, $4)`, ref.TaskID, attemptID, workerID, until)
+	_, err := t.tx.Exec(ctx, `INSERT INTO task_leases (task_id, attempt_id, worker_id, lease_until, claimed_at)
+		VALUES ($1, $2, $3, $4, $5)`, ref.TaskID, attemptID, workerID, until, t.now)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("insert lease: %w", err)
 	}
@@ -114,17 +115,17 @@ func (t *Tx) InsertLease(ctx context.Context, ref TaskRef, attemptID uuid.UUID, 
 func (t *Tx) LockLease(ctx context.Context, attemptID uuid.UUID) (*Lease, error) {
 	var l Lease
 	err := t.tx.QueryRow(ctx, `
-		SELECT l.task_id, tk.workflow_id, l.attempt_id, l.worker_id, l.lease_until, l.revoked
+		SELECT l.task_id, tk.workflow_id, l.attempt_id, l.worker_id, l.lease_until, l.revoked, l.claimed_at
 		  FROM task_leases l JOIN tasks tk ON tk.id = l.task_id
 		 WHERE l.attempt_id = $1 FOR UPDATE OF l`, attemptID).
-		Scan(&l.TaskID, &l.WorkflowID, &l.AttemptID, &l.WorkerID, &l.LeaseUntil, &l.Revoked)
+		Scan(&l.TaskID, &l.WorkflowID, &l.AttemptID, &l.WorkerID, &l.LeaseUntil, &l.Revoked, &l.ClaimedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lock lease: %w", err)
 	}
-	l.LeaseUntil = l.LeaseUntil.UTC()
+	l.LeaseUntil, l.ClaimedAt = l.LeaseUntil.UTC(), l.ClaimedAt.UTC()
 	return &l, nil
 }
 
@@ -163,7 +164,7 @@ func (t *Tx) ExtendLeases(ctx context.Context, workerID string, attemptIDs []uui
 // Leases returns the current leases among attemptIDs, without locking.
 func (t *Tx) Leases(ctx context.Context, attemptIDs []uuid.UUID) (map[uuid.UUID]Lease, error) {
 	rows, err := t.tx.Query(ctx, `
-		SELECT l.task_id, tk.workflow_id, l.attempt_id, l.worker_id, l.lease_until, l.revoked
+		SELECT l.task_id, tk.workflow_id, l.attempt_id, l.worker_id, l.lease_until, l.revoked, l.claimed_at
 		  FROM task_leases l JOIN tasks tk ON tk.id = l.task_id
 		 WHERE l.attempt_id = ANY($1)`, attemptIDs)
 	if err != nil {
@@ -173,10 +174,10 @@ func (t *Tx) Leases(ctx context.Context, attemptIDs []uuid.UUID) (map[uuid.UUID]
 	out := map[uuid.UUID]Lease{}
 	for rows.Next() {
 		var l Lease
-		if err := rows.Scan(&l.TaskID, &l.WorkflowID, &l.AttemptID, &l.WorkerID, &l.LeaseUntil, &l.Revoked); err != nil {
+		if err := rows.Scan(&l.TaskID, &l.WorkflowID, &l.AttemptID, &l.WorkerID, &l.LeaseUntil, &l.Revoked, &l.ClaimedAt); err != nil {
 			return nil, err
 		}
-		l.LeaseUntil = l.LeaseUntil.UTC()
+		l.LeaseUntil, l.ClaimedAt = l.LeaseUntil.UTC(), l.ClaimedAt.UTC()
 		out[l.AttemptID] = l
 	}
 	return out, rows.Err()
@@ -186,7 +187,7 @@ func (t *Tx) Leases(ctx context.Context, attemptIDs []uuid.UUID) (map[uuid.UUID]
 // their workflow rows. Lease is locked before workflow, so SKIP LOCKED.
 func (t *Tx) ExpiredLeases(ctx context.Context, limit int) ([]Lease, error) {
 	rows, err := t.tx.Query(ctx, `
-		SELECT l.task_id, tk.workflow_id, l.attempt_id, l.worker_id, l.lease_until, l.revoked
+		SELECT l.task_id, tk.workflow_id, l.attempt_id, l.worker_id, l.lease_until, l.revoked, l.claimed_at
 		  FROM task_leases l
 		  JOIN tasks tk ON tk.id = l.task_id
 		  JOIN workflows w ON w.id = tk.workflow_id
@@ -201,10 +202,10 @@ func (t *Tx) ExpiredLeases(ctx context.Context, limit int) ([]Lease, error) {
 	var out []Lease
 	for rows.Next() {
 		var l Lease
-		if err := rows.Scan(&l.TaskID, &l.WorkflowID, &l.AttemptID, &l.WorkerID, &l.LeaseUntil, &l.Revoked); err != nil {
+		if err := rows.Scan(&l.TaskID, &l.WorkflowID, &l.AttemptID, &l.WorkerID, &l.LeaseUntil, &l.Revoked, &l.ClaimedAt); err != nil {
 			return nil, err
 		}
-		l.LeaseUntil = l.LeaseUntil.UTC()
+		l.LeaseUntil, l.ClaimedAt = l.LeaseUntil.UTC(), l.ClaimedAt.UTC()
 		out = append(out, l)
 	}
 	return out, rows.Err()
