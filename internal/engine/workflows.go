@@ -1,0 +1,234 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/omer-ulucan/baton/internal/state"
+	"github.com/omer-ulucan/baton/internal/store"
+	"github.com/omer-ulucan/baton/internal/workflow"
+)
+
+// ErrWorkflowNotFound is returned for an unknown workflow id.
+var ErrWorkflowNotFound = errors.New("workflow not found")
+
+// Submission is a request to run a workflow.
+type Submission struct {
+	Definition  []byte          // YAML
+	Input       json.RawMessage // JSON object, optional
+	Priority    *int            // overrides the definition's priority
+	Key         string          // client idempotency key, optional
+	CallbackURL string          // receives a workflow.terminal webhook, optional
+}
+
+// Submitted is the outcome of Submit.
+type Submitted struct {
+	WorkflowID uuid.UUID
+	Status     state.WorkflowStatus
+	// Existing is true when Key matched an earlier submission, which is
+	// returned unchanged.
+	Existing bool
+}
+
+// Submit validates a definition and starts a workflow: one task per step,
+// with the steps that have no dependencies ready at once.
+func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) {
+	if sub.Key != "" {
+		if out, ok, err := e.existing(ctx, sub.Key); err != nil || ok {
+			return out, err
+		}
+	}
+	parsed, err := workflow.Parse(sub.Definition)
+	if err != nil {
+		return Submitted{}, err
+	}
+	if err := validateSubmission(sub); err != nil {
+		return Submitted{}, err
+	}
+	def := parsed.Definition
+	priority := def.Priority
+	if sub.Priority != nil {
+		priority = *sub.Priority
+	}
+	wfID, err := uuid.NewV7()
+	if err != nil {
+		return Submitted{}, err
+	}
+
+	var status state.WorkflowStatus
+	err = e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+		defID, err := tx.InsertDefinition(ctx, def.Name, def.Version, parsed.SHA256[:], parsed.Spec)
+		if err != nil {
+			return err
+		}
+		var key *string
+		if sub.Key != "" {
+			key = &sub.Key
+		}
+		changes := []state.Change{{Payload: state.WorkflowSubmitted{
+			DefinitionID: defID, Priority: priority, Input: sub.Input, SubmitKey: key, CallbackURL: sub.CallbackURL,
+		}}}
+		for _, name := range def.Order {
+			st, _ := def.Step(name)
+			p := priority
+			if st.PriorityExplicit {
+				p = st.Priority
+			}
+			id, err := uuid.NewV7()
+			if err != nil {
+				return err
+			}
+			changes = append(changes, state.Change{TaskID: id, Payload: state.TaskCreated{
+				Step: st.Name, Kind: state.KindStep, Handler: st.Handler, Queue: st.Queue, Priority: p,
+				MaxAttempts: st.Retry.MaxAttempts, IdempotencyKey: idempotencyKey(wfID, st.Name, state.KindStep),
+			}})
+		}
+		snap := state.NewSnapshot()
+		e.defs.put(defID, &def)
+		if err := e.commit(ctx, tx, snap, wfID, changes); err != nil {
+			return err
+		}
+		status = snap.Workflow.Status
+		return nil
+	})
+	if isUniqueViolation(err) && sub.Key != "" {
+		// Lost a race with a concurrent submission of the same key.
+		if out, ok, err := e.existing(ctx, sub.Key); err != nil || ok {
+			return out, err
+		}
+	}
+	if err != nil {
+		return Submitted{}, err
+	}
+	return Submitted{WorkflowID: wfID, Status: status}, nil
+}
+
+func (e *Engine) existing(ctx context.Context, key string) (Submitted, bool, error) {
+	id, ok, err := e.store.WorkflowBySubmitKey(ctx, key)
+	if err != nil || !ok {
+		return Submitted{}, false, err
+	}
+	snap, err := e.store.Snapshot(ctx, id)
+	if err != nil {
+		return Submitted{}, false, err
+	}
+	return Submitted{WorkflowID: id, Status: snap.Workflow.Status, Existing: true}, true, nil
+}
+
+func validateSubmission(sub Submission) error {
+	var problems []string
+	if len(sub.Input) > 0 {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(sub.Input, &obj) != nil || obj == nil {
+			problems = append(problems, "input must be a JSON object")
+		}
+		if len(sub.Input) > workflow.MaxInputLen {
+			problems = append(problems, fmt.Sprintf("input is %d bytes, limit %d", len(sub.Input), workflow.MaxInputLen))
+		}
+	}
+	if sub.Priority != nil && (*sub.Priority < 0 || *sub.Priority > 100) {
+		problems = append(problems, "priority must be in [0,100]")
+	}
+	if sub.CallbackURL != "" {
+		u, err := url.Parse(sub.CallbackURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			problems = append(problems, "callback_url must be an absolute http(s) URL")
+		}
+	}
+	if len(sub.Key) > 200 {
+		problems = append(problems, "idempotency key is longer than 200 characters")
+	}
+	if len(problems) > 0 {
+		return &workflow.ValidationError{Problems: problems}
+	}
+	return nil
+}
+
+func idempotencyKey(wf uuid.UUID, step string, kind state.TaskKind) string {
+	return fmt.Sprintf("%s/%s/%s", wf, step, kind)
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// Cancel ends a workflow (SPEC 3.2). Queued and running tasks are
+// cancelled in the same transaction and running attempts' leases revoked,
+// so their next heartbeat stops them. With compensate, completed steps are
+// compensated first (SPEC 3.3).
+func (e *Engine) Cancel(ctx context.Context, wfID uuid.UUID, compensate bool, reason string) error {
+	if compensate {
+		return fmt.Errorf("%w: cancel with compensation is not supported yet", ErrInvalid)
+	}
+	return e.updateWorkflow(ctx, wfID, func(snap *state.Snapshot) ([]state.Change, error) {
+		changes := []state.Change{{Payload: state.WorkflowCancelRequested{Compensate: compensate, Reason: clean(reason)}}}
+		for _, t := range stepTasks(snap, nil) {
+			if !t.Status.Terminal() {
+				changes = append(changes, state.Change{TaskID: t.ID, Payload: state.TaskCancelled{}})
+			}
+		}
+		return append(changes, state.Change{Payload: state.WorkflowCancelled{}}), nil
+	})
+}
+
+// Pause stops new claims of a workflow's tasks; running attempts finish.
+func (e *Engine) Pause(ctx context.Context, wfID uuid.UUID) error {
+	return e.updateWorkflow(ctx, wfID, func(*state.Snapshot) ([]state.Change, error) {
+		return []state.Change{{Payload: state.WorkflowPaused{}}}, nil
+	})
+}
+
+// Resume lets a paused workflow continue. Steps whose dependencies
+// finished while it was paused become ready at once; retries whose time
+// passed are picked up by the retry timer.
+func (e *Engine) Resume(ctx context.Context, wfID uuid.UUID) error {
+	return e.updateWorkflow(ctx, wfID, func(*state.Snapshot) ([]state.Change, error) {
+		return []state.Change{{Payload: state.WorkflowResumed{}}}, nil
+	})
+}
+
+// RetryDLQ requeues a dead-lettered task with a fresh attempt budget. If
+// its workflow had failed, the workflow runs again (SPEC 3.2).
+func (e *Engine) RetryDLQ(ctx context.Context, taskID uuid.UUID, by string) error {
+	wf, err := e.workflowOf(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	return e.updateWorkflow(ctx, wf, func(snap *state.Snapshot) ([]state.Change, error) {
+		t := snap.Tasks[taskID]
+		if t.Status != state.TsDeadLettered {
+			return nil, fmt.Errorf("%w: task is %s, not dead_lettered", ErrInvalid, t.Status)
+		}
+		var changes []state.Change
+		switch snap.Workflow.Status {
+		case state.WfFailed, state.WfCompensationFailed:
+			changes = append(changes, state.Change{Payload: state.WorkflowRetried{}})
+		}
+		return append(changes, state.Change{TaskID: taskID, Payload: state.TaskRequeued{By: clean(by)}}), nil
+	})
+}
+
+func (e *Engine) updateWorkflow(ctx context.Context, wfID uuid.UUID, decide func(*state.Snapshot) ([]state.Change, error)) error {
+	return e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+		snap, err := tx.Load(ctx, wfID)
+		if err != nil {
+			return err
+		}
+		if snap.Workflow == nil {
+			return ErrWorkflowNotFound
+		}
+		changes, err := decide(snap)
+		if err != nil {
+			return err
+		}
+		err = e.commit(ctx, tx, snap, wfID, changes)
+		return err
+	})
+}
