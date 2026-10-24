@@ -36,6 +36,7 @@ type Elector struct {
 	cancel    context.CancelFunc
 	done      chan struct{}
 	changes   int
+	noRelease bool
 }
 
 // New builds an Elector.
@@ -160,16 +161,27 @@ func (e *Elector) demote(reason string) {
 	}
 }
 
+// SkipRelease makes Run stop without releasing the lease, as a crashed
+// process would; followers must wait for it to expire. For crash tests.
+func (e *Elector) SkipRelease() {
+	e.mu.Lock()
+	e.noRelease = true
+	e.mu.Unlock()
+}
+
 // resign gives the lease up on shutdown. ctx is already done, so the
 // release runs on a detached context with its own short deadline.
 func (e *Elector) resign(ctx context.Context) {
 	e.mu.Lock()
-	leading, token := e.leading, e.token
+	leading, token, skip := e.leading, e.token, e.noRelease
 	e.mu.Unlock()
 	if !leading {
 		return
 	}
 	e.demote("shutting down")
+	if skip {
+		return
+	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	if err := e.store.ReleaseLeadership(rctx, e.cfg.ID, token); err != nil {
