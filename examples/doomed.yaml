@@ -1,0 +1,11 @@
+# Fails permanently in step "b": the workflow fails, c is skipped, and the
+# task waits in the DLQ for `batonctl dlq retry`.
+name: doomed-demo
+version: 1
+steps:
+  - { name: a, handler: echo }
+  - name: b
+    handler: flaky
+    depends_on: [a]
+    input: { fail_attempts: 99, permanent: true, message: "card declined" }
+  - { name: c, handler: echo, depends_on: [b] }

@@ -67,6 +67,7 @@ type (
 		Priority     int             `json:"priority"`
 		Input        json.RawMessage `json:"input,omitempty"`
 		SubmitKey    *string         `json:"submit_key,omitempty"`
+		CallbackURL  string          `json:"callback_url,omitempty"`
 	}
 	WorkflowDeferred        struct{}
 	WorkflowAdmitted        struct{}

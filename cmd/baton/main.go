@@ -71,9 +71,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	st := store.New(pool)
 	eng := engine.New(engine.Options{
-		Store: store.New(pool),
-		Log:   log,
+		Store:         st,
+		Log:           log,
+		EscalationURL: cfg.EscalationWebhook,
 		Config: engine.Config{
 			LeaseTTL:          cfg.LeaseTTL,
 			HeartbeatInterval: cfg.HeartbeatInterval,
@@ -90,7 +92,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           server.New(server.Deps{DB: pool, Worker: eng, Log: log}),
+		Handler:           server.New(server.Deps{DB: pool, Worker: eng, Commands: eng, Reader: st, Log: log}),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}

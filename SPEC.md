@@ -570,6 +570,8 @@ can enforce on remote code.
 JSON over HTTP. Full schema in `api/openapi.yaml` (OpenAPI 3.1), which is the
 contract; this section is a summary. Errors use
 `{"error": {"code": "snake_case", "message": "...", "details": {...}}}`.
+Handlers receive the workflow input with the step's `input` merged over it
+(shallow, step keys win); both must be JSON objects.
 All endpoints accept and propagate W3C `traceparent`.
 
 ### 8.1 Public API (`/v1`)
@@ -584,7 +586,7 @@ All endpoints accept and propagate W3C `traceparent`.
 | `POST /v1/workflows/{id}/pause` | | `200` | `409` |
 | `POST /v1/workflows/{id}/resume` | | `200` | `409` |
 | `GET /v1/dlq?queue=&limit=&cursor=` | Dead-lettered tasks with last error and last decision | `200` | |
-| `POST /v1/dlq/{task_id}/retry` | Manual retry | `200` | `409 not_dead_lettered` |
+| `POST /v1/dlq/{task_id}/retry` | Manual retry; optional `Baton-Actor` header is recorded in `TaskRequeued.by` | `200` | `409 invalid_transition` |
 | `GET /v1/queues` | Depth, running, limits per queue | `200` | |
 | `PUT /v1/queues/{queue}` | Set `queue_config` | `200` | `422` |
 | `GET /healthz` | Liveness | `200` | |

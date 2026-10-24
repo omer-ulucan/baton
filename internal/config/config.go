@@ -26,6 +26,7 @@ type Orchestrator struct {
 	AgingSeconds      int
 	DecisionPolicy    string // "rule" | "laya"
 	DecisionThreshold float64
+	EscalationWebhook string // receives escalation messages; empty disables them
 }
 
 // Worker is the configuration of a baton-worker process.
@@ -53,6 +54,7 @@ func LoadOrchestrator(getenv func(string) string, hostname string) (Orchestrator
 		AgingSeconds:      r.positiveInt("BATON_AGING_SECONDS", 30),
 		DecisionPolicy:    r.str("BATON_DECISION_POLICY", "rule"),
 		DecisionThreshold: r.float("BATON_DECISION_THRESHOLD", 0.5),
+		EscalationWebhook: r.str("BATON_ESCALATION_WEBHOOK", ""),
 	}
 	c.AdvertiseAddr = r.str("BATON_ADVERTISE_ADDR", defaultAdvertise(c.ReplicaID, c.HTTPAddr))
 

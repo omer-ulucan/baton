@@ -38,10 +38,15 @@ type DecideFunc func(s *state.Snapshot, now time.Time) ([]state.Change, error)
 // another order uses SKIP LOCKED so it never waits, which rules out
 // deadlocks between writers.
 type Tx struct {
-	tx    pgx.Tx
-	fence Fence
-	now   time.Time
+	tx          pgx.Tx
+	fence       Fence
+	now         time.Time
+	afterCommit []func()
 }
+
+// AfterCommit registers fn to run once the transaction has committed, for
+// in-process side effects that must not happen if it rolls back.
+func (t *Tx) AfterCommit(fn func()) { t.afterCommit = append(t.afterCommit, fn) }
 
 // Now is the database clock at the start of the transaction. Every event
 // and lease decision in the transaction uses it.
@@ -49,14 +54,22 @@ func (t *Tx) Now() time.Time { return t.now }
 
 // InTx runs fn in a transaction, committing if it returns nil.
 func (s *Store) InTx(ctx context.Context, fence Fence, fn func(*Tx) error) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		t := &Tx{tx: tx, fence: fence}
+	t := &Tx{fence: fence}
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		t.tx, t.afterCommit = tx, nil
 		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&t.now); err != nil {
 			return fmt.Errorf("read clock: %w", err)
 		}
 		t.now = t.now.UTC()
 		return fn(t)
 	})
+	if err != nil {
+		return err
+	}
+	for _, f := range t.afterCommit {
+		f()
+	}
+	return nil
 }
 
 // Load locks a workflow row and returns its snapshot. The lock serializes

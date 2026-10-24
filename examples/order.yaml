@@ -1,0 +1,23 @@
+# A diamond DAG on the built-in handlers: charge, then reserve and notify in
+# parallel, then ship. "flaky" fails its first attempt to show a retry.
+name: order-demo
+version: 1
+priority: 50
+defaults:
+  timeout: 30s
+  retry: { max_attempts: 4, initial_backoff: 500ms, max_backoff: 5s }
+steps:
+  - name: charge
+    handler: flaky
+    input: { fail_attempts: 1 }
+  - name: reserve
+    handler: sleep
+    depends_on: [charge]
+    input: { ms: 300 }
+  - name: notify
+    handler: echo
+    depends_on: [charge]
+  - name: ship
+    handler: sleep
+    depends_on: [reserve, notify]
+    input: { ms: 200 }
