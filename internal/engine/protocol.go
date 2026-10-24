@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/omer-ulucan/baton/internal/decision"
 	"github.com/omer-ulucan/baton/internal/state"
@@ -57,6 +59,7 @@ type Assignment struct {
 	MaxAttempts    int
 	Deadline       time.Time
 	LeaseUntil     time.Time
+	TraceParent    string // the workflow's trace, for the worker's execution span
 }
 
 // Claim grants leases on ready tasks the worker can run. With Wait > 0 it
@@ -93,6 +96,7 @@ func (e *Engine) Claim(ctx context.Context, req ClaimRequest) ([]Assignment, err
 
 func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment, error) {
 	var out []Assignment
+	start := time.Now()
 	err := e.inTx(ctx, func(tx *store.Tx) error {
 		out = out[:0]
 		queues, handlers, ok, err := tx.Worker(ctx, req.WorkerID)
@@ -179,13 +183,21 @@ func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment,
 				TaskID: t.ID, AttemptID: att, WorkflowID: t.WorkflowID, Step: t.StepName, Kind: t.Kind,
 				Handler: t.Handler, Queue: t.Queue, Input: handlerInput(def, sub, t), IdempotencyKey: t.IdempotencyKey,
 				Attempt: t.Attempt, MaxAttempts: t.MaxAttempts,
-				Deadline: tx.Now().Add(timeout), LeaseUntil: until,
+				Deadline: tx.Now().Add(timeout), LeaseUntil: until, TraceParent: sub.TraceParent,
 			})
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	if len(out) > 0 {
+		// Only claims that granted work are traced and timed; empty polls
+		// would drown everything else.
+		e.obs.Claimed(time.Since(start))
+		_, sp := e.tracer.Start(ctx, "task.claim", trace.WithTimestamp(start),
+			trace.WithAttributes(attribute.String("worker.id", req.WorkerID), attribute.Int("tasks", len(out))))
+		sp.End()
 	}
 	return out, nil
 }
@@ -254,6 +266,8 @@ type Result struct {
 // Complete records a successful attempt. Repeating an accepted report is
 // a no-op; a report for an attempt that is no longer current is rejected.
 func (e *Engine) Complete(ctx context.Context, r Result, output json.RawMessage) error {
+	ctx, sp := e.tracer.Start(ctx, "task.complete", trace.WithAttributes(attribute.String("task.id", r.TaskID.String())))
+	defer sp.End()
 	wf, err := e.workflowOf(ctx, r.TaskID)
 	if err != nil {
 		return err
@@ -263,9 +277,12 @@ func (e *Engine) Complete(ctx context.Context, r Result, output json.RawMessage)
 		if err != nil {
 			return err
 		}
-		if err := e.checkLease(ctx, tx, snap, r, state.EvTaskSucceeded); err != nil {
+		l, err := e.checkLease(ctx, tx, snap, r, state.EvTaskSucceeded)
+		if err != nil {
 			return err
 		}
+		queue, dur := snap.Tasks[r.TaskID].Queue, tx.Now().Sub(l.ClaimedAt)
+		tx.AfterCommit(func() { e.obs.TaskFinished(queue, "succeeded", dur) })
 		if err := e.commit(ctx, tx, snap, wf, []state.Change{{
 			TaskID: r.TaskID, Payload: state.TaskSucceeded{AttemptID: r.AttemptID, OutputDigest: digest(output)},
 		}}); err != nil {
@@ -304,6 +321,8 @@ const (
 // bounded by Config.DecisionTimeout, and falls back to the rule policy on
 // error or timeout.
 func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
+	ctx, sp := e.tracer.Start(ctx, "task.fail", trace.WithAttributes(attribute.String("task.id", r.TaskID.String())))
+	defer sp.End()
 	f.Message, f.Type, f.Stack = clean(f.Message), clean(f.Type), clean(f.Stack)
 	if len(f.Stack) > MaxStackLen {
 		f.Stack = f.Stack[:MaxStackLen]
@@ -331,7 +350,8 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 		if err != nil {
 			return err
 		}
-		if err := e.checkLease(ctx, tx, snap, r, state.EvTaskFailed); err != nil {
+		l, err := e.checkLease(ctx, tx, snap, r, state.EvTaskFailed)
+		if err != nil {
 			if errors.Is(err, errDuplicate) {
 				next = nextOf(snap.Tasks[r.TaskID])
 			}
@@ -369,6 +389,13 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 		if err := e.commit(ctx, tx, snap, wf, changes); err != nil {
 			return err
 		}
+		queue, dur, retried := t.Queue, tx.Now().Sub(l.ClaimedAt), next == NextRetry
+		tx.AfterCommit(func() {
+			e.obs.TaskFinished(queue, "failed", dur)
+			if retried {
+				e.obs.RetryScheduled(queue)
+			}
+		})
 		return tx.DeleteLease(ctx, t.ID)
 	})
 	if errors.Is(err, errDuplicate) {
@@ -398,6 +425,8 @@ func (e *Engine) dispose(def *workflow.Definition, t *state.Task, label string, 
 
 func (e *Engine) triage(ctx context.Context, req decision.Request) (decision.Decision, time.Duration) {
 	start := time.Now()
+	ctx, sp := e.tracer.Start(ctx, "decision")
+	defer sp.End()
 	dctx, cancel := context.WithTimeout(ctx, e.cfg.DecisionTimeout)
 	defer cancel()
 	d, err := e.policy.Decide(dctx, req)
@@ -410,6 +439,7 @@ func (e *Engine) triage(ctx context.Context, req decision.Request) (decision.Dec
 		d, _ = decision.RulePolicy{}.Decide(ctx, req)
 		d.Fallback = reason
 	}
+	sp.AddEvent("decided", decisionAttrs(req.Kind, d))
 	return d, time.Since(start)
 }
 
@@ -465,6 +495,8 @@ func (e *Engine) Release(ctx context.Context, workerID string, attempts []uuid.U
 			if t.Status != state.TsRunning || t.CurrentAttempt == nil || *t.CurrentAttempt != l.AttemptID {
 				return tx.DeleteLease(ctx, l.TaskID)
 			}
+			queue, dur := t.Queue, tx.Now().Sub(l.ClaimedAt)
+			tx.AfterCommit(func() { e.obs.TaskFinished(queue, "released", dur) })
 			if err := e.commit(ctx, tx, snap, l.WorkflowID, []state.Change{{
 				TaskID: l.TaskID, Payload: state.TaskReleased{AttemptID: l.AttemptID},
 			}}); err != nil {
@@ -489,36 +521,36 @@ var errDuplicate = errors.New("duplicate report")
 // checkLease verifies that r is the current, live attempt of its task and
 // that the reporting worker holds its lease. A repeat of an already
 // accepted report of type typ returns errDuplicate.
-func (e *Engine) checkLease(ctx context.Context, tx *store.Tx, snap *state.Snapshot, r Result, typ state.EventType) error {
+func (e *Engine) checkLease(ctx context.Context, tx *store.Tx, snap *state.Snapshot, r Result, typ state.EventType) (*store.Lease, error) {
 	t, ok := snap.Tasks[r.TaskID]
 	if !ok {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	l, err := tx.LockLease(ctx, r.AttemptID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if l == nil || l.TaskID != r.TaskID {
 		if dup, err := e.isDuplicate(ctx, tx, t, r, typ); err != nil || dup {
 			if err != nil {
-				return err
+				return nil, err
 			}
-			return errDuplicate
+			return nil, errDuplicate
 		}
 		if t.Status == state.TsCancelled {
-			return ErrCancelled
+			return nil, ErrCancelled
 		}
-		return ErrAttemptSuperseded
+		return nil, ErrAttemptSuperseded
 	}
 	switch {
 	case l.WorkerID != r.WorkerID:
-		return ErrAttemptSuperseded
+		return nil, ErrAttemptSuperseded
 	case l.Revoked:
-		return ErrCancelled
+		return nil, ErrCancelled
 	case !l.LeaseUntil.After(tx.Now()):
-		return ErrLeaseExpired
+		return nil, ErrLeaseExpired
 	}
-	return nil
+	return l, nil
 }
 
 func (e *Engine) isDuplicate(ctx context.Context, tx *store.Tx, t *state.Task, r Result, typ state.EventType) (bool, error) {

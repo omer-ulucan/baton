@@ -50,6 +50,15 @@ func (e *Engine) ReapExpired(ctx context.Context) (int, error) {
 			if err := tx.DeleteLease(ctx, l.TaskID); err != nil {
 				return err
 			}
+			queue, dur := t.Queue, tx.Now().Sub(l.ClaimedAt)
+			_, retried := disposition.Payload.(state.TaskRetryScheduled)
+			tx.AfterCommit(func() {
+				e.obs.LeaseExpired(queue)
+				e.obs.TaskFinished(queue, "expired", dur)
+				if retried {
+					e.obs.RetryScheduled(queue)
+				}
+			})
 			n++
 		}
 		return nil

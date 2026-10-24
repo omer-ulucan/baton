@@ -68,6 +68,8 @@ type (
 		Input        json.RawMessage `json:"input,omitempty"`
 		SubmitKey    *string         `json:"submit_key,omitempty"`
 		CallbackURL  string          `json:"callback_url,omitempty"`
+		// TraceParent links the workflow's tasks to the submission's trace.
+		TraceParent string `json:"traceparent,omitempty"`
 	}
 	WorkflowDeferred        struct{}
 	WorkflowAdmitted        struct{}

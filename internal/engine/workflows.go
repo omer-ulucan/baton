@@ -11,10 +11,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/omer-ulucan/baton/internal/decision"
 	"github.com/omer-ulucan/baton/internal/state"
 	"github.com/omer-ulucan/baton/internal/store"
+	"github.com/omer-ulucan/baton/internal/telemetry"
 	"github.com/omer-ulucan/baton/internal/workflow"
 )
 
@@ -42,6 +44,8 @@ type Submitted struct {
 // Submit validates a definition and starts a workflow: one task per step,
 // with the steps that have no dependencies ready at once.
 func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) {
+	ctx, sp := e.tracer.Start(ctx, "workflow.submit")
+	defer sp.End()
 	if sub.Key != "" {
 		if out, ok, err := e.existing(ctx, sub.Key); err != nil || ok {
 			return out, err
@@ -84,6 +88,7 @@ func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) 
 		}
 		changes := []state.Change{{Payload: state.WorkflowSubmitted{
 			DefinitionID: defID, Priority: priority, Input: sub.Input, SubmitKey: key, CallbackURL: sub.CallbackURL,
+			TraceParent: telemetry.TraceParent(ctx),
 		}}}
 		for _, name := range def.Order {
 			st, _ := def.Step(name)
@@ -143,6 +148,7 @@ func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) 
 	if err != nil {
 		return Submitted{}, err
 	}
+	sp.SetAttributes(attribute.String("workflow.id", wfID.String()), attribute.String("workflow.name", def.Name))
 	return Submitted{WorkflowID: wfID, Status: status}, nil
 }
 
@@ -206,7 +212,10 @@ func (e *Engine) classifyPriorities(ctx context.Context, def *workflow.Definitio
 		}
 		wg.Go(func() {
 			start := time.Now()
+			ctx, sp := e.tracer.Start(ctx, "decision")
+			defer sp.End()
 			d, err := e.policy.Decide(ctx, decision.Request{Kind: decision.KindPriority, TaskID: ids[st.Name], Description: st.Description})
+			sp.AddEvent("decided", decisionAttrs(decision.KindPriority, d))
 			if err != nil {
 				e.log.WarnContext(ctx, "priority classification failed; step keeps its inherited priority", "step", st.Name, "err", err)
 				return

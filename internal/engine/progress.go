@@ -246,6 +246,8 @@ func (e *Engine) commit(ctx context.Context, tx *store.Tx, snap *state.Snapshot,
 		case state.WorkflowSucceeded, state.WorkflowFailed, state.WorkflowCancelled,
 			state.CompensationCompleted, state.CompensationFailed:
 			if snap.Workflow.Status.Terminal() {
+				status := string(snap.Workflow.Status)
+				tx.AfterCommit(func() { e.obs.WorkflowFinished(status) })
 				if err := e.queueTerminal(ctx, tx, snap.Workflow); err != nil {
 					return err
 				}
