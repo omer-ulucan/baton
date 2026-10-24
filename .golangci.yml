@@ -1,0 +1,35 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - gocritic
+    - misspell
+    - noctx
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+  settings:
+    sloglint:
+      kv-only: true
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+      - common-false-positives
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/omer-ulucan/baton
