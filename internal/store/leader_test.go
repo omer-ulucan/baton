@@ -142,7 +142,11 @@ func TestTakeoverWaitsForInFlightLeaderTransaction(t *testing.T) {
 	fence := store.Fence{Token: old}
 
 	inTx := make(chan struct{})
-	committed := make(chan time.Time, 1)
+	// closing is when the old leader's transaction stops being open from
+	// the client's side: just before COMMIT is sent. The server can finish
+	// the commit, and release the waiting takeover, before the client sees
+	// the reply, so "after the reply" would be the wrong boundary.
+	closing := make(chan time.Time, 1)
 	go func() {
 		wf := uuid.New()
 		err := s.InTx(context.Background(), fence, func(tx *store.Tx) error {
@@ -155,12 +159,12 @@ func TestTakeoverWaitsForInFlightLeaderTransaction(t *testing.T) {
 			}
 			close(inTx)
 			time.Sleep(600 * time.Millisecond) // a GC pause, holding the transaction open
+			closing <- time.Now()
 			return nil
 		})
 		if err != nil {
 			t.Errorf("old leader's open transaction: %v", err)
 		}
-		committed <- time.Now()
 	}()
 	<-inTx
 	time.Sleep(300 * time.Millisecond) // lease has lapsed; the transaction is still open
@@ -169,9 +173,8 @@ func TestTakeoverWaitsForInFlightLeaderTransaction(t *testing.T) {
 	if !ok || newer != old+1 {
 		t.Fatalf("takeover = %d %t", newer, ok)
 	}
-	commitAt := <-committed
-	if tookOver.Before(commitAt) {
-		t.Fatalf("takeover completed %s before the old leader's transaction committed", commitAt.Sub(tookOver))
+	if openUntil := <-closing; tookOver.Before(openUntil) {
+		t.Fatalf("takeover completed %s while the old leader's transaction was still open", openUntil.Sub(tookOver))
 	}
 	if err := submitWith(t, s, fence); !errors.Is(err, store.ErrFenced) {
 		t.Fatalf("old leader after takeover: %v", err)
