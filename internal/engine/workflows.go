@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/omer-ulucan/baton/internal/decision"
 	"github.com/omer-ulucan/baton/internal/state"
 	"github.com/omer-ulucan/baton/internal/store"
 	"github.com/omer-ulucan/baton/internal/workflow"
@@ -60,6 +63,14 @@ func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) 
 	if err != nil {
 		return Submitted{}, err
 	}
+	taskIDs := make(map[string]uuid.UUID, len(def.Order))
+	for _, name := range def.Order {
+		if taskIDs[name], err = uuid.NewV7(); err != nil {
+			return Submitted{}, err
+		}
+	}
+	// Decide before the transaction, never inside it (SPEC 10.2).
+	priorities := e.classifyPriorities(ctx, &def, taskIDs)
 
 	var status state.WorkflowStatus
 	err = e.inTx(ctx, func(tx *store.Tx) error {
@@ -77,17 +88,21 @@ func (e *Engine) Submit(ctx context.Context, sub Submission) (Submitted, error) 
 		for _, name := range def.Order {
 			st, _ := def.Step(name)
 			p := priority
-			if st.PriorityExplicit {
+			cl, classified := priorities[name]
+			switch {
+			case st.PriorityExplicit:
 				p = st.Priority
+			case classified:
+				p = decision.PriorityValue(cl.d.Label, priority)
 			}
-			id, err := uuid.NewV7()
-			if err != nil {
-				return err
-			}
+			id := taskIDs[name]
 			changes = append(changes, state.Change{TaskID: id, Payload: state.TaskCreated{
 				Step: st.Name, Kind: state.KindStep, Handler: st.Handler, Queue: st.Queue, Priority: p,
 				MaxAttempts: st.Retry.MaxAttempts, IdempotencyKey: idempotencyKey(wfID, st.Name, state.KindStep),
 			}})
+			if classified {
+				changes = append(changes, state.Change{TaskID: id, Payload: decisionEvent(decision.KindPriority, cl.d, nil, cl.latency)})
+			}
 		}
 		snap := state.NewSnapshot()
 		e.defs.put(defID, &def)
@@ -148,6 +163,39 @@ func validateSubmission(sub Submission) error {
 		return &workflow.ValidationError{Problems: problems}
 	}
 	return nil
+}
+
+type classified struct {
+	d       decision.Decision
+	latency time.Duration
+}
+
+// classifyPriorities asks the decision layer for the priority of every
+// step that has a description and no explicit priority, concurrently, so
+// a submission waits at most one decision timeout.
+func (e *Engine) classifyPriorities(ctx context.Context, def *workflow.Definition, ids map[string]uuid.UUID) map[string]classified {
+	out := map[string]classified{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := range def.Steps {
+		st := &def.Steps[i]
+		if st.PriorityExplicit || st.Description == "" {
+			continue
+		}
+		wg.Go(func() {
+			start := time.Now()
+			d, err := e.policy.Decide(ctx, decision.Request{Kind: decision.KindPriority, TaskID: ids[st.Name], Description: st.Description})
+			if err != nil {
+				e.log.WarnContext(ctx, "priority classification failed; step keeps its inherited priority", "step", st.Name, "err", err)
+				return
+			}
+			mu.Lock()
+			out[st.Name] = classified{d: d, latency: time.Since(start)}
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	return out
 }
 
 func idempotencyKey(wf uuid.UUID, step string, kind state.TaskKind) string {
