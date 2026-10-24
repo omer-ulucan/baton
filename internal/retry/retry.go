@@ -25,13 +25,15 @@ type Policy struct {
 	Jitter         Jitter        `json:"jitter"`
 }
 
-// Default is the policy of a step that declares none.
-var Default = Policy{
-	MaxAttempts:    5,
-	InitialBackoff: time.Second,
-	MaxBackoff:     5 * time.Minute,
-	Multiplier:     2,
-	Jitter:         JitterFull,
+// DefaultPolicy is the policy of a step that declares none.
+func DefaultPolicy() Policy {
+	return Policy{
+		MaxAttempts:    5,
+		InitialBackoff: time.Second,
+		MaxBackoff:     5 * time.Minute,
+		Multiplier:     2,
+		Jitter:         JitterFull,
+	}
 }
 
 // Validate reports a policy outside the allowed ranges.

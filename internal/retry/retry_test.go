@@ -64,7 +64,7 @@ func TestBackoffUsesInjectedRandom(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	if err := Default.Validate(); err != nil {
+	if err := DefaultPolicy().Validate(); err != nil {
 		t.Fatalf("Default invalid: %v", err)
 	}
 	bad := []Policy{
