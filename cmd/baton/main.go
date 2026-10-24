@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/omer-ulucan/baton/internal/config"
+	"github.com/omer-ulucan/baton/internal/engine"
 	"github.com/omer-ulucan/baton/internal/server"
 	"github.com/omer-ulucan/baton/internal/store"
 )
@@ -70,9 +71,26 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	eng := engine.New(engine.Options{
+		Store: store.New(pool),
+		Log:   log,
+		Config: engine.Config{
+			LeaseTTL:          cfg.LeaseTTL,
+			HeartbeatInterval: cfg.HeartbeatInterval,
+		},
+	})
+	// Until leader election (phase 5) every replica runs the timer loops;
+	// that is safe because they lock with SKIP LOCKED and Apply rejects
+	// stale transitions, but it is not the intended single-runner design.
+	loopsDone := make(chan struct{})
+	go func() {
+		defer close(loopsDone)
+		eng.Run(ctx)
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           server.New(pool, log),
+		Handler:           server.New(server.Deps{DB: pool, Worker: eng, Log: log}),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
@@ -96,6 +114,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	<-loopsDone
 	return nil
 }
 
