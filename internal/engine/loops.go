@@ -14,7 +14,7 @@ import (
 // consults a decision policy (SPEC 10.2). It returns the number reaped.
 func (e *Engine) ReapExpired(ctx context.Context) (int, error) {
 	n := 0
-	err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err := e.inTx(ctx, func(tx *store.Tx) error {
 		n = 0
 		if err := tx.PurgeRevokedLeases(ctx); err != nil {
 			return err
@@ -67,7 +67,7 @@ func (e *Engine) ReapExpired(ctx context.Context) (int, error) {
 // Tasks of paused workflows stay in retry_wait until resumed.
 func (e *Engine) PromoteRetries(ctx context.Context) (int, error) {
 	n := 0
-	err := e.store.InTx(ctx, e.fence(), func(tx *store.Tx) error {
+	err := e.inTx(ctx, func(tx *store.Tx) error {
 		n = 0
 		refs, err := tx.DueRetries(ctx, e.cfg.LoopBatch)
 		if err != nil {
