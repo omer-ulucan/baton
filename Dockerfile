@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage: one toolchain image builds every binary.
-FROM golang:1.26-trixie AS build
+FROM golang:1.27-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
