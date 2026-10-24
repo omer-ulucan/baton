@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"time"
 )
 
 // Leadership tells the server whether this replica may execute writes and,
@@ -27,10 +28,11 @@ type forwarder struct {
 	log     *slog.Logger
 	mu      sync.Mutex
 	proxies map[string]*httputil.ReverseProxy
+	warned  map[string]time.Time // last "forward failed" log per leader
 }
 
 func newForwarder(lead Leadership, self string, log *slog.Logger) *forwarder {
-	return &forwarder{lead: lead, self: self, log: log, proxies: map[string]*httputil.ReverseProxy{}}
+	return &forwarder{lead: lead, self: self, log: log, proxies: map[string]*httputil.ReverseProxy{}, warned: map[string]time.Time{}}
 }
 
 // write wraps a write handler.
@@ -70,12 +72,24 @@ func (f *forwarder) proxy(addr string) *httputil.ReverseProxy {
 			pr.Out.Header.Set(forwardedHeader, f.self)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			f.log.WarnContext(r.Context(), "forward to leader failed", "leader", addr, "err", err)
+			if f.shouldWarn(addr) { // a dead leader fails every request until failover
+				f.log.WarnContext(r.Context(), "forward to leader failed", "leader", addr, "err", err)
+			}
 			notLeader(w)
 		},
 	}
 	f.proxies[addr] = p
 	return p
+}
+
+func (f *forwarder) shouldWarn(addr string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if time.Since(f.warned[addr]) < time.Second {
+		return false
+	}
+	f.warned[addr] = time.Now()
+	return true
 }
 
 // notLeader answers 503 so clients and workers retry shortly, by which
