@@ -14,10 +14,7 @@ import (
 )
 
 // Step is one event of a batch, before seq and time are assigned.
-type Step struct {
-	TaskID  uuid.UUID
-	Payload state.Payload
-}
+type Step = state.Change
 
 // Batch is a set of events that must be applied atomically, as one
 // transaction of the real write path would.
@@ -96,23 +93,23 @@ func candidates(r *rand.Rand, s *state.Snapshot, now time.Time) []Batch {
 	for _, t := range tasks {
 		switch t.Status {
 		case state.TsPending, state.TsRetryWait:
-			add(Step{t.ID, state.TaskReady{}})
+			add(Step{TaskID: t.ID, Payload: state.TaskReady{}})
 		case state.TsReady:
-			add(Step{t.ID, state.TaskClaimed{AttemptID: uuid.New(), WorkerID: fmt.Sprintf("w%d", r.IntN(4)), Attempt: t.Attempt + 1}})
+			add(Step{TaskID: t.ID, Payload: state.TaskClaimed{AttemptID: uuid.New(), WorkerID: fmt.Sprintf("w%d", r.IntN(4)), Attempt: t.Attempt + 1}})
 		case state.TsRunning:
 			att := *t.CurrentAttempt
-			add(Step{t.ID, state.TaskSucceeded{AttemptID: att}})
-			add(Step{t.ID, state.TaskReleased{AttemptID: att}})
+			add(Step{TaskID: t.ID, Payload: state.TaskSucceeded{AttemptID: att}})
+			add(Step{TaskID: t.ID, Payload: state.TaskReleased{AttemptID: att}})
 			for _, end := range []state.Payload{
 				state.TaskFailed{AttemptID: att, Message: "error " + t.StepName},
 				state.TaskLeaseExpired{AttemptID: att},
 			} {
-				decision := Step{t.ID, state.DecisionMade{Kind: "triage", Label: "retry", Confidence: 1, Policy: "rule", InputHash: "x"}}
+				decision := Step{TaskID: t.ID, Payload: state.DecisionMade{Kind: "triage", Label: "retry", Confidence: 1, Policy: "rule", InputHash: "x"}}
 				if t.Attempt < t.MaxAttempts {
 					delay := time.Duration(r.IntN(5000)) * time.Millisecond
-					add(Step{t.ID, end}, decision, Step{t.ID, state.TaskRetryScheduled{RunAt: now.Add(delay), DelayMS: delay.Milliseconds()}})
+					add(Step{TaskID: t.ID, Payload: end}, decision, Step{TaskID: t.ID, Payload: state.TaskRetryScheduled{RunAt: now.Add(delay), DelayMS: delay.Milliseconds()}})
 				}
-				add(Step{t.ID, end}, decision, Step{t.ID, state.TaskDeadLettered{Reason: "decision"}})
+				add(Step{TaskID: t.ID, Payload: end}, decision, Step{TaskID: t.ID, Payload: state.TaskDeadLettered{Reason: "decision"}})
 			}
 		}
 	}
@@ -137,7 +134,7 @@ func candidates(r *rand.Rand, s *state.Snapshot, now time.Time) []Batch {
 				kind = state.KindCompensation
 			}
 			if t := find(tasks, kind, state.TsDeadLettered); t != nil {
-				add(Step{Payload: state.WorkflowRetried{}}, Step{t.ID, state.TaskRequeued{By: "test"}})
+				add(Step{Payload: state.WorkflowRetried{}}, Step{TaskID: t.ID, Payload: state.TaskRequeued{By: "test"}})
 			}
 		}
 	}
@@ -155,7 +152,7 @@ func fail(s *state.Snapshot, tasks []*state.Task, cause *state.Task) Batch {
 	b := Batch{{Payload: state.WorkflowFailed{CauseTaskID: cause.ID}}}
 	for _, t := range tasks {
 		if t.Kind == state.KindStep && t.Status == state.TsPending {
-			b = append(b, Step{t.ID, state.TaskSkipped{}})
+			b = append(b, Step{TaskID: t.ID, Payload: state.TaskSkipped{}})
 		}
 	}
 	return append(b, startCompensation(s, tasks)...)
@@ -165,7 +162,7 @@ func cancel(s *state.Snapshot, tasks []*state.Task, compensate bool) Batch {
 	b := Batch{{Payload: state.WorkflowCancelRequested{Compensate: compensate, Reason: "test"}}}
 	for _, t := range tasks {
 		if !t.Status.Terminal() {
-			b = append(b, Step{t.ID, state.TaskCancelled{}})
+			b = append(b, Step{TaskID: t.ID, Payload: state.TaskCancelled{}})
 		}
 	}
 	if comp := startCompensation(s, tasks); compensate && len(comp) > 0 {
@@ -202,7 +199,7 @@ func finishCompensation(tasks []*state.Task, cancelRequested bool) []Batch {
 		if cancelRequested {
 			for _, t := range tasks {
 				if t.Kind == state.KindCompensation && t.Status == state.TsPending {
-					b = append(b, Step{t.ID, state.TaskSkipped{}})
+					b = append(b, Step{TaskID: t.ID, Payload: state.TaskSkipped{}})
 				}
 			}
 			b = append(b, Step{Payload: state.WorkflowCancelled{}})

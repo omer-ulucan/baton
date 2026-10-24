@@ -284,3 +284,10 @@ func DecodePayload(t EventType, data []byte) (Payload, error) {
 func deref(p Payload) Payload {
 	return reflect.ValueOf(p).Elem().Interface().(Payload)
 }
+
+// Change is an event as proposed by the engine, before the writer assigns
+// its seq and occurred_at.
+type Change struct {
+	TaskID  uuid.UUID
+	Payload Payload
+}
