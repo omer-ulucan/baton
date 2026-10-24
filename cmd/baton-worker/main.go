@@ -17,7 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/omer-ulucan/baton/internal/config"
+	"github.com/omer-ulucan/baton/internal/telemetry"
 	"github.com/omer-ulucan/baton/internal/worker"
 	"github.com/omer-ulucan/baton/internal/worker/builtin"
 )
@@ -39,14 +42,22 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	tracing, err := telemetry.NewTracing(ctx, "baton-worker", os.Getenv)
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	defer func() { _ = tracing.Shutdown(context.WithoutCancel(ctx)) }()
 	// Claims long-poll for up to 20s; the client timeout must exceed it.
-	client := worker.NewClient(cfg.OrchestratorAddrs, &http.Client{Timeout: 45 * time.Second})
-	r := worker.NewRunner(client, builtin.Handlers(), worker.Config{
+	// The transport propagates the execution span to the orchestrator.
+	hc := &http.Client{Timeout: 45 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport,
+		otelhttp.WithTracerProvider(tracing.Provider), otelhttp.WithPropagators(telemetry.Propagator))}
+	r := worker.NewRunner(worker.NewClient(cfg.OrchestratorAddrs, hc), builtin.Handlers(), worker.Config{
 		ID:           cfg.WorkerID,
 		Queues:       cfg.Queues,
 		Concurrency:  cfg.Concurrency,
 		DrainTimeout: cfg.DrainTimeout,
 		Version:      version(),
+		Tracer:       tracing.Provider,
 	}, log)
 	return r.Run(ctx)
 }

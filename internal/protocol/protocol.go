@@ -72,6 +72,9 @@ type Task struct {
 	MaxAttempts    int             `json:"max_attempts"`
 	Deadline       time.Time       `json:"deadline"`
 	LeaseUntil     time.Time       `json:"lease_until"`
+	// TraceParent is the workflow's W3C trace context; the worker's
+	// execution span joins that trace.
+	TraceParent string `json:"traceparent,omitempty"`
 }
 
 type ClaimResponse struct {
