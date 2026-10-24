@@ -34,7 +34,9 @@ decisions recorded with the revision that made them.
 
 - Upgrading the model is a code change (new revision and hashes), reviewed
   like any other.
-- The orchestrator image is about 1.8 GB larger.
+- The `baton-laya` image is about 1.7 GB larger than `baton`, which fetches
+  the model on first start instead; the plain image carries only
+  libonnxruntime (28 MB).
 
 ## int8 (resolved)
 
