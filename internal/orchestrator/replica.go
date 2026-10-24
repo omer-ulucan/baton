@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/omer-ulucan/baton/internal/config"
 	"github.com/omer-ulucan/baton/internal/decision"
@@ -23,6 +25,7 @@ import (
 	"github.com/omer-ulucan/baton/internal/leader"
 	"github.com/omer-ulucan/baton/internal/server"
 	"github.com/omer-ulucan/baton/internal/store"
+	"github.com/omer-ulucan/baton/internal/telemetry"
 )
 
 // Options configure a replica.
@@ -34,6 +37,9 @@ type Options struct {
 	// Engine, when set, adjusts engine options (tests use it for fast
 	// retries and short polls).
 	Engine func(*engine.Options)
+	// Metrics and Tracer default to a fresh registry and a no-op tracer.
+	Metrics *telemetry.Metrics
+	Tracer  trace.TracerProvider
 }
 
 // Replica is one orchestrator process.
@@ -59,13 +65,24 @@ func New(o Options) *Replica {
 		log = slog.New(slog.DiscardHandler)
 	}
 	log = log.With("replica", o.Config.ReplicaID)
+	if o.Metrics == nil {
+		o.Metrics = telemetry.NewMetrics()
+	}
+	if o.Tracer == nil {
+		o.Tracer = noop.NewTracerProvider()
+	}
 	st := store.New(o.Pool)
 	el := leader.New(st, leader.Config{ID: o.Config.ReplicaID, Addr: o.Config.AdvertiseAddr, TTL: o.Config.LeaderTTL}, log)
-	policy, loader := decisionPolicy(o.Config, log)
+	policy, loader := decisionPolicy(o.Config, log, o.Metrics.Decision)
+	sources := telemetry.Sources{QueueStats: st.QueueStats, OutboxPending: st.OutboxPending, IsLeader: el.IsLeader, LeaderChanges: el.Changes}
+	if loader != nil {
+		sources.ModelLoaded = loader.Loaded
+	}
+	o.Metrics.Observe(sources)
 	eo := engine.Options{
 		Store: st, Log: log, Fence: el.Fence, EscalationURL: o.Config.EscalationWebhook,
 		OnFenced: func() { el.Demote("write rejected by fencing") },
-		Policy:   policy,
+		Policy:   policy, Observer: o.Metrics, Tracer: o.Tracer.Tracer("baton"),
 		Config: engine.Config{
 			LeaseTTL: o.Config.LeaseTTL, HeartbeatInterval: o.Config.HeartbeatInterval,
 			// An outer guard only: the fallback policy enforces the real deadline.
@@ -79,6 +96,7 @@ func New(o Options) *Replica {
 	handler := server.New(server.Deps{
 		DB: o.Pool, Worker: eng, Commands: eng, Reader: st,
 		Leadership: el, ReplicaID: o.Config.ReplicaID, Log: log,
+		Metrics: o.Metrics.Handler(), Tracer: o.Tracer,
 	})
 	return &Replica{
 		cfg: o.Config, pool: o.Pool, ln: o.Listener, log: log, store: st, elector: el, engine: eng, loader: loader,
@@ -148,7 +166,7 @@ func (r *Replica) Run(ctx context.Context) error {
 
 // decisionPolicy builds the policy the engine uses: always the fallback
 // policy, with Laya as primary when configured (SPEC 10.1).
-func decisionPolicy(c config.Orchestrator, log *slog.Logger) (decision.Policy, *laya.Loader) {
+func decisionPolicy(c config.Orchestrator, log *slog.Logger, observe func(decision.Request, decision.Decision, time.Duration)) (decision.Policy, *laya.Loader) {
 	var primary decision.Policy = decision.RulePolicy{}
 	var loader *laya.Loader
 	if c.DecisionPolicy == "laya" {
@@ -171,6 +189,7 @@ func decisionPolicy(c config.Orchestrator, log *slog.Logger) (decision.Policy, *
 	return decision.FallbackPolicy{
 		Primary: primary, Fallback: decision.RulePolicy{}, Threshold: c.DecisionThreshold,
 		Timeouts: map[decision.Kind]time.Duration{decision.KindTriage: c.TriageTimeout, decision.KindPriority: c.PriorityTimeout},
+		Observe:  observe,
 	}, loader
 }
 

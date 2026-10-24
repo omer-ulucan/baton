@@ -21,12 +21,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/omer-ulucan/baton/internal/config"
 	"github.com/omer-ulucan/baton/internal/laya/model"
 	"github.com/omer-ulucan/baton/internal/orchestrator"
 	"github.com/omer-ulucan/baton/internal/store"
+	"github.com/omer-ulucan/baton/internal/telemetry"
 )
 
 func main() {
@@ -75,7 +77,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 		log.Info("database migrated", "replica", cfg.ReplicaID)
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	tracing, err := telemetry.NewTracing(ctx, "baton", os.Getenv)
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	defer func() { _ = tracing.Shutdown(context.WithoutCancel(ctx)) }()
+	pcfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	pcfg.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTracerProvider(tracing.Provider))
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
@@ -84,7 +96,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	return orchestrator.New(orchestrator.Options{Config: cfg, Pool: pool, Listener: ln, Log: log}).Run(ctx)
+	return orchestrator.New(orchestrator.Options{
+		Config: cfg, Pool: pool, Listener: ln, Log: log, Tracer: tracing.Provider,
+	}).Run(ctx)
 }
 
 // fetchModel downloads the pinned model files, verifying every one. It is

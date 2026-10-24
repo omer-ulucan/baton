@@ -12,8 +12,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/omer-ulucan/baton/internal/protocol"
+	"github.com/omer-ulucan/baton/internal/telemetry"
 )
 
 // Task is what a handler receives.
@@ -55,6 +60,9 @@ type Config struct {
 	DrainTimeout time.Duration // at shutdown, default 25s
 	ClaimWait    time.Duration // long-poll duration, default 20s
 	Version      string
+	// Tracer creates the execution span of each attempt, as a child of its
+	// workflow's trace; nil disables tracing.
+	Tracer trace.TracerProvider
 }
 
 // Runner claims tasks and runs their handlers until its context ends,
@@ -194,6 +202,11 @@ func (r *Runner) register(ctx context.Context) error {
 }
 
 func (r *Runner) execute(work context.Context, t protocol.Task) {
+	work, sp := r.tracer().Start(telemetry.WithTraceParent(work, t.TraceParent), "task.execute "+t.Handler,
+		trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(
+			attribute.String("task.id", t.TaskID.String()), attribute.String("workflow.id", t.WorkflowID.String()),
+			attribute.String("task.step", t.Step), attribute.Int("task.attempt", t.Attempt)))
+	defer sp.End()
 	ctx, cancel := context.WithDeadline(work, t.Deadline)
 	defer cancel()
 	a := &attempt{task: t, cancel: cancel}
@@ -225,6 +238,7 @@ func (r *Runner) execute(work context.Context, t protocol.Task) {
 		}
 		return
 	}
+	sp.SetStatus(codes.Error, err.Error())
 	te := protocol.TaskError{Message: err.Error(), Type: errorType(err), Stack: stack}
 	var p permanent
 	if errors.As(err, &p) {
@@ -241,6 +255,13 @@ func (r *Runner) execute(work context.Context, t protocol.Task) {
 	if err != nil {
 		log.WarnContext(work, "fail rejected", "err", err)
 	}
+}
+
+func (r *Runner) tracer() trace.Tracer {
+	if r.cfg.Tracer == nil {
+		return noop.NewTracerProvider().Tracer("baton-worker")
+	}
+	return r.cfg.Tracer.Tracer("baton-worker")
 }
 
 // call runs the handler, turning a panic into an error with its stack.

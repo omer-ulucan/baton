@@ -88,6 +88,7 @@ func (h workerHandlers) claim(w http.ResponseWriter, r *http.Request) {
 			TaskID: a.TaskID, AttemptID: a.AttemptID, WorkflowID: a.WorkflowID, Step: a.Step, Kind: string(a.Kind),
 			Handler: a.Handler, Queue: a.Queue, Input: a.Input, IdempotencyKey: a.IdempotencyKey,
 			Attempt: a.Attempt, MaxAttempts: a.MaxAttempts, Deadline: a.Deadline, LeaseUntil: a.LeaseUntil,
+			TraceParent: a.TraceParent,
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

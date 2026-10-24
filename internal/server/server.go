@@ -7,6 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/omer-ulucan/baton/internal/telemetry"
 )
 
 // Pinger reports whether the database is reachable.
@@ -28,6 +33,11 @@ type Deps struct {
 	Leadership Leadership
 	ReplicaID  string
 	Log        *slog.Logger
+	// Metrics serves /metrics when set.
+	Metrics http.Handler
+	// Tracer, when set, traces every request, continuing the caller's
+	// trace context.
+	Tracer trace.TracerProvider
 }
 
 // New returns the orchestrator's HTTP handler.
@@ -45,6 +55,9 @@ func New(d Deps) http.Handler {
 		registerWorkerRoutes(mux, d.Worker, fw, log)
 	}
 	registerPublicRoutes(mux, d.Commands, d.Reader, fw, log)
+	if d.Metrics != nil {
+		mux.Handle("GET /metrics", d.Metrics)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -66,7 +79,21 @@ func New(d Deps) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, body)
 	})
-	return mux
+	if d.Tracer == nil {
+		return mux
+	}
+	return otelhttp.NewHandler(mux, "baton",
+		otelhttp.WithTracerProvider(d.Tracer), otelhttp.WithPropagators(telemetry.Propagator),
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			// The route pattern, not the path: ids would explode the names.
+			if _, pattern := mux.Handler(r); pattern != "" {
+				return pattern
+			}
+			return r.Method
+		}),
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics"
+		}))
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
