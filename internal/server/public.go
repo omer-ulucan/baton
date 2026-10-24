@@ -37,14 +37,14 @@ type Reader interface {
 
 const maxDefinition = 1 << 20
 
-func registerPublicRoutes(mux *http.ServeMux, cmd Commands, rd Reader, log *slog.Logger) {
+func registerPublicRoutes(mux *http.ServeMux, cmd Commands, rd Reader, fw *forwarder, log *slog.Logger) {
 	h := publicHandlers{cmd: cmd, rd: rd, log: log}
 	if cmd != nil {
-		mux.HandleFunc("POST /v1/workflows", h.submit)
-		mux.HandleFunc("POST /v1/workflows/{id}/cancel", h.cancel)
-		mux.HandleFunc("POST /v1/workflows/{id}/pause", h.simple(cmd.Pause))
-		mux.HandleFunc("POST /v1/workflows/{id}/resume", h.simple(cmd.Resume))
-		mux.HandleFunc("POST /v1/dlq/{task_id}/retry", h.retryDLQ)
+		mux.Handle("POST /v1/workflows", fw.write(h.submit))
+		mux.Handle("POST /v1/workflows/{id}/cancel", fw.write(h.cancel))
+		mux.Handle("POST /v1/workflows/{id}/pause", fw.write(h.simple(cmd.Pause)))
+		mux.Handle("POST /v1/workflows/{id}/resume", fw.write(h.simple(cmd.Resume)))
+		mux.Handle("POST /v1/dlq/{task_id}/retry", fw.write(h.retryDLQ))
 	}
 	if rd != nil {
 		mux.HandleFunc("GET /v1/workflows", h.list)
@@ -246,6 +246,8 @@ func (h publicHandlers) dlq(w http.ResponseWriter, r *http.Request) {
 func (h publicHandlers) respondErr(w http.ResponseWriter, r *http.Request, err error) {
 	var ve *workflow.ValidationError
 	switch {
+	case errors.Is(err, store.ErrFenced):
+		notLeader(w)
 	case errors.As(err, &ve):
 		writePublicError(w, http.StatusUnprocessableEntity, api.CodeInvalidDefinition, "invalid workflow submission",
 			map[string]any{"problems": ve.Problems})
