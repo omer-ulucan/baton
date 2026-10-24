@@ -35,6 +35,9 @@ func TestOrchestratorDefaults(t *testing.T) {
 	if c.AgingSeconds != 30 {
 		t.Errorf("AgingSeconds = %d, want 30", c.AgingSeconds)
 	}
+	if c.TriageTimeout != 1500*time.Millisecond || c.PriorityTimeout != 1500*time.Millisecond || c.LayaVariant != "fp32" || !c.ModelDownload {
+		t.Errorf("decision defaults: %+v", c)
+	}
 	if c.DecisionPolicy != "rule" || c.DecisionThreshold != 0.5 {
 		t.Errorf("decision defaults = %q %v", c.DecisionPolicy, c.DecisionThreshold)
 	}
@@ -84,6 +87,7 @@ func TestOrchestratorValidation(t *testing.T) {
 		{"threshold out of range", map[string]string{"BATON_DECISION_THRESHOLD": "1.5"}, "BATON_DECISION_THRESHOLD"},
 		{"bad int", map[string]string{"BATON_AGING_SECONDS": "x"}, "BATON_AGING_SECONDS"},
 		{"bad bool", map[string]string{"BATON_AUTO_MIGRATE": "maybe"}, "BATON_AUTO_MIGRATE"},
+		{"bad variant", map[string]string{"BATON_LAYA_VARIANT": "int8"}, "BATON_LAYA_VARIANT"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
