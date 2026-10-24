@@ -4,11 +4,14 @@
 //
 //	baton              run the orchestrator
 //	baton migrate      apply pending database migrations and exit
+//	baton model fetch  download and verify the pinned Laya model
+//	                   [--small] [--variant fp32|fp16] [--dir DIR]
 //	baton healthcheck  probe the local /healthz (for container health checks)
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -21,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/omer-ulucan/baton/internal/config"
+	"github.com/omer-ulucan/baton/internal/laya/model"
 	"github.com/omer-ulucan/baton/internal/orchestrator"
 	"github.com/omer-ulucan/baton/internal/store"
 )
@@ -36,9 +40,12 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "migrate":
 		err = migrate()
-	} else {
+	case len(os.Args) > 2 && os.Args[1] == "model" && os.Args[2] == "fetch":
+		err = fetchModel(ctx, os.Args[3:], log)
+	default:
 		err = run(ctx, log)
 	}
 	stop()
@@ -78,6 +85,34 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	return orchestrator.New(orchestrator.Options{Config: cfg, Pool: pool, Listener: ln, Log: log}).Run(ctx)
+}
+
+// fetchModel downloads the pinned model files, verifying every one. It is
+// how the image bakes the model and how CI gets the small files.
+func fetchModel(ctx context.Context, args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("model fetch", flag.ContinueOnError)
+	small := fs.Bool("small", false, "only tokenizer.json and config.json")
+	variant := fs.String("variant", "fp32", "fp32 or fp16")
+	dir := fs.String("dir", os.Getenv("BATON_MODEL_DIR"), "model dir (default: the user cache)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		var err error
+		if *dir, err = model.DefaultDir(); err != nil {
+			return err
+		}
+	}
+	files, err := model.Files(model.Variant(*variant), *small)
+	if err != nil {
+		return err
+	}
+	fe := &model.Fetcher{Log: func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }}
+	if err := fe.Fetch(ctx, *dir, files); err != nil {
+		return err
+	}
+	log.Info("model verified", "dir", *dir, "revision", model.Revision, "files", len(files))
+	return nil
 }
 
 func migrate() error {
