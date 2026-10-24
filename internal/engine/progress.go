@@ -20,13 +20,22 @@ import (
 // definition (the DAG engine): ready the pending steps whose dependencies
 // all succeeded, then finish the workflow if every step succeeded, or fail
 // it once a step is dead-lettered and nothing that could still run is
-// left. It is pure: a function of the snapshot and the definition.
+// left, starting compensation if any is due; a compensating workflow
+// advances its chain. It is a function of the snapshot and the definition
+// only (new task ids aside).
 func progress(s *state.Snapshot, def *workflow.Definition) []state.Change {
 	w := s.Workflow
-	if w == nil || w.Status != state.WfRunning || w.CancelRequested {
+	if w == nil {
 		return nil
 	}
 	sb := newSandbox(s, w.ID)
+	if w.Status == state.WfCompensating {
+		advanceCompensation(sb, def)
+		return sb.changes
+	}
+	if w.Status != state.WfRunning || w.CancelRequested {
+		return nil
+	}
 	steps := stepTasks(sb.s, def)
 
 	for _, t := range steps {
@@ -54,15 +63,16 @@ func progress(s *state.Snapshot, def *workflow.Definition) []state.Change {
 	case len(steps) > 0 && allDone:
 		sb.add(uuid.Nil, state.WorkflowSucceeded{})
 	case cause != nil && !anyActive:
-		failWorkflow(sb, cause.ID)
+		failWorkflow(sb, def, cause.ID)
 	}
 	return sb.changes
 }
 
 // failWorkflow fails a running workflow: cancel any step still in flight
 // or queued (only the compensate decision fails a workflow with siblings
-// active) and skip the steps that can no longer run.
-func failWorkflow(sb *sandbox, cause uuid.UUID) {
+// active), skip the steps that can no longer run, and start compensating
+// the steps that completed.
+func failWorkflow(sb *sandbox, def *workflow.Definition, cause uuid.UUID) {
 	sb.add(uuid.Nil, state.WorkflowFailed{CauseTaskID: cause})
 	for _, t := range stepTasks(sb.s, nil) {
 		switch t.Status {
@@ -72,6 +82,7 @@ func failWorkflow(sb *sandbox, cause uuid.UUID) {
 			sb.add(t.ID, state.TaskSkipped{})
 		}
 	}
+	startCompensation(sb, def)
 }
 
 func depsSucceeded(s *state.Snapshot, def *workflow.Definition, step string) bool {
