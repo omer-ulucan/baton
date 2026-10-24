@@ -18,9 +18,11 @@ const readyTimeout = 2 * time.Second
 
 // Deps are the server's collaborators.
 type Deps struct {
-	DB     Pinger
-	Worker WorkerProtocol // nil disables the worker protocol endpoints
-	Log    *slog.Logger
+	DB       Pinger
+	Worker   WorkerProtocol // nil disables the worker protocol endpoints
+	Commands Commands       // nil disables the public write endpoints
+	Reader   Reader         // nil disables the public read endpoints
+	Log      *slog.Logger
 }
 
 // New returns the orchestrator's HTTP handler.
@@ -33,6 +35,7 @@ func New(d Deps) http.Handler {
 	if d.Worker != nil {
 		registerWorkerRoutes(mux, d.Worker, log)
 	}
+	registerPublicRoutes(mux, d.Commands, d.Reader, log)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})

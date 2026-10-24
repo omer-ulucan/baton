@@ -182,12 +182,17 @@ func errorCode(err error) (string, int) {
 // decode reads a JSON body strictly. On failure it writes a 4xx and
 // returns false.
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	return decodeLimit(w, r, v, maxBody)
+}
+
+// decodeLimit is decode with a body size limit.
+func decodeLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeError(w, http.StatusRequestEntityTooLarge, protocol.CodeInvalidRequest, fmt.Sprintf("body exceeds %d bytes", maxBody))
+			writeError(w, http.StatusRequestEntityTooLarge, protocol.CodeInvalidRequest, fmt.Sprintf("body exceeds %d bytes", limit))
 			return false
 		}
 		writeError(w, http.StatusBadRequest, protocol.CodeInvalidRequest, "malformed JSON: "+err.Error())
