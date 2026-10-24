@@ -16,9 +16,23 @@ type Pinger interface {
 
 const readyTimeout = 2 * time.Second
 
+// Deps are the server's collaborators.
+type Deps struct {
+	DB     Pinger
+	Worker WorkerProtocol // nil disables the worker protocol endpoints
+	Log    *slog.Logger
+}
+
 // New returns the orchestrator's HTTP handler.
-func New(db Pinger, log *slog.Logger) http.Handler {
+func New(d Deps) http.Handler {
+	db, log := d.DB, d.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 	mux := http.NewServeMux()
+	if d.Worker != nil {
+		registerWorkerRoutes(mux, d.Worker, log)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})

@@ -1,20 +1,25 @@
-// Command baton-worker runs task handlers against an orchestrator.
+// Command baton-worker runs task handlers against an orchestrator. It talks
+// to the orchestrator's HTTP API only and never connects to the database.
 //
-// The worker protocol (register, claim, heartbeat, complete, fail) lands in
-// phase 3. Until then the worker loads its configuration and waits for a
-// shutdown signal, so the compose stack and process supervision can be
-// exercised end to end.
+// This binary ships the built-in handlers (echo, sleep, flaky). Real
+// deployments build their own worker binary around worker.Runner with
+// their handlers.
 package main
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
+	"time"
 
 	"github.com/omer-ulucan/baton/internal/config"
+	"github.com/omer-ulucan/baton/internal/worker"
+	"github.com/omer-ulucan/baton/internal/worker/builtin"
 )
 
 func main() {
@@ -34,8 +39,21 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	log.Info("worker started", "worker", cfg.WorkerID, "orchestrator", cfg.OrchestratorAddr, "queues", cfg.Queues)
-	<-ctx.Done()
-	log.Info("worker stopping", "worker", cfg.WorkerID)
-	return nil
+	// Claims long-poll for up to 20s; the client timeout must exceed it.
+	client := worker.NewClient(cfg.OrchestratorAddr, &http.Client{Timeout: 45 * time.Second})
+	r := worker.NewRunner(client, builtin.Handlers(), worker.Config{
+		ID:           cfg.WorkerID,
+		Queues:       cfg.Queues,
+		Concurrency:  cfg.Concurrency,
+		DrainTimeout: cfg.DrainTimeout,
+		Version:      version(),
+	}, log)
+	return r.Run(ctx)
+}
+
+func version() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		return bi.Main.Version
+	}
+	return ""
 }

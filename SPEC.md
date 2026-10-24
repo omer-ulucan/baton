@@ -598,8 +598,8 @@ All endpoints accept and propagate W3C `traceparent`.
 | `POST /register` | `{worker_id, queues[], handlers[], version}` | `200 {heartbeat_interval_ms, lease_ttl_ms}` |
 | `POST /claim` | `{worker_id, queues[], max: 1..32, wait_ms: 0..30000}` | `200 {tasks: [{task_id, attempt_id, workflow_id, step, handler, input, idempotency_key, attempt, deadline, lease_until}]}`; long-polls up to `wait_ms` when empty |
 | `POST /heartbeat` | `{worker_id, attempts: [attempt_id...]}` | `200 {extended: [{attempt_id, lease_until}], revoked: [{attempt_id, reason}]}` (`reason`: `cancelled` \| `superseded` \| `expired`) |
-| `POST /complete` | `{worker_id, attempt_id, output: {...}}` | `200` \| `409 attempt_superseded` \| `409 cancelled` |
-| `POST /fail` | `{worker_id, attempt_id, error: {message, type?, stack?, retryable?}}` | `200 {next: "retry" | "dead_letter" | ...}` \| `409` |
+| `POST /complete` | `{worker_id, task_id, attempt_id, output: {...}}` | `200` \| `409 attempt_superseded` \| `409 cancelled` |
+| `POST /fail` | `{worker_id, task_id, attempt_id, error: {message, type?, stack?, retryable?}}` | `200 {next: "retry" | "dead_letter" | ...}` \| `409` |
 | `POST /release` | `{worker_id, attempt_ids[]}` | `200` |
 
 Claim is one transaction:
@@ -615,7 +615,16 @@ SELECT t.id FROM tasks t
 ```
 
 followed by per-queue limit checks (section 9), `TaskClaimed` events, and
-`task_leases` inserts. Lease TTL default 30s, heartbeat interval default 10s
+`task_leases` inserts. The claim locks task and workflow rows with
+`FOR UPDATE OF t, w SKIP LOCKED`: every other writer locks workflow before
+task before lease, and the claim, reaper and retry-timer queries, which
+take them in another order, never wait, so writers cannot deadlock.
+
+Results carry `task_id` as well as `attempt_id` so the orchestrator can lock
+the task's workflow first (lock order) before checking the lease. Results
+are accepted only from the worker holding the current attempt's live,
+unrevoked lease; heartbeats never revive an expired lease. Worker-supplied
+text is stripped of NUL bytes and invalid UTF-8 before it is stored. Lease TTL default 30s, heartbeat interval default 10s
 (both env-configurable, `lease_ttl >= 3 * heartbeat_interval` enforced at
 startup).
 
@@ -695,7 +704,8 @@ type Decision struct {
     Fallback      string  // "" | "low_confidence" | "timeout" | "error" | "unavailable"
 }
 
-type DecisionPolicy interface {
+// decision.Policy; called DecisionPolicy elsewhere in this document.
+type Policy interface {
     Decide(ctx context.Context, req Request) (Decision, error)
 }
 ```

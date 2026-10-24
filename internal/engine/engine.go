@@ -1,0 +1,164 @@
+// Package engine is the orchestrator's core: the worker protocol (claim,
+// heartbeat, complete, fail, release), the lease reaper and the retry
+// timer. Every state change goes through store transactions and
+// state.Apply; the engine only decides which events to propose.
+package engine
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"log/slog"
+	"math/rand/v2"
+	"strings"
+	"time"
+
+	"github.com/omer-ulucan/baton/internal/decision"
+	"github.com/omer-ulucan/baton/internal/retry"
+	"github.com/omer-ulucan/baton/internal/state"
+	"github.com/omer-ulucan/baton/internal/store"
+)
+
+// Protocol errors. The HTTP layer maps them to status codes.
+var (
+	ErrUnknownWorker     = errors.New("worker is not registered")
+	ErrNotFound          = errors.New("task not found")
+	ErrAttemptSuperseded = errors.New("attempt is no longer current")
+	ErrCancelled         = errors.New("workflow was cancelled")
+	ErrLeaseExpired      = errors.New("lease expired")
+	ErrInvalid           = errors.New("invalid request")
+)
+
+// Config tunes the engine. Zero values take the defaults in New.
+type Config struct {
+	LeaseTTL          time.Duration // default 30s
+	HeartbeatInterval time.Duration // default 10s
+	ClaimPoll         time.Duration // long-poll recheck period, default 250ms
+	MaxClaimWait      time.Duration // default 30s
+	MaxClaimBatch     int           // default 32
+	LoopBatch         int           // reaper and retry timer batch, default 100
+	ReapInterval      time.Duration // default 1s
+	RetryInterval     time.Duration // default 500ms
+	DecisionTimeout   time.Duration // triage budget, default 1500ms
+	DefaultTimeout    time.Duration // per-attempt timeout without a step setting, default 5m
+}
+
+// Options are the engine's collaborators.
+type Options struct {
+	Store  *store.Store
+	Log    *slog.Logger
+	Config Config
+	// Fence returns the writer's current fencing token (leader election
+	// supplies it from phase 5).
+	Fence func() store.Fence
+	// Policy triages failures; defaults to decision.RulePolicy.
+	Policy decision.Policy
+	// RetryPolicy returns a task's retry policy; defaults to retry.DefaultPolicy.
+	RetryPolicy func(*state.Task) retry.Policy
+	// Timeout returns a task's per-attempt timeout; defaults to Config.DefaultTimeout.
+	Timeout func(*state.Task) time.Duration
+	// Rand returns uniform values in [0,1) for jitter; defaults to math/rand/v2.
+	Rand func() float64
+}
+
+// Engine implements the worker protocol and the leader's timer loops.
+type Engine struct {
+	store       *store.Store
+	log         *slog.Logger
+	cfg         Config
+	fence       func() store.Fence
+	policy      decision.Policy
+	retryPolicy func(*state.Task) retry.Policy
+	timeout     func(*state.Task) time.Duration
+	rand        func() float64
+	ready       *notifier
+}
+
+// New builds an Engine, filling defaults.
+func New(o Options) *Engine {
+	c := o.Config
+	c.LeaseTTL = orDefault(c.LeaseTTL, 30*time.Second)
+	c.HeartbeatInterval = orDefault(c.HeartbeatInterval, 10*time.Second)
+	c.ClaimPoll = orDefault(c.ClaimPoll, 250*time.Millisecond)
+	c.MaxClaimWait = orDefault(c.MaxClaimWait, 30*time.Second)
+	c.ReapInterval = orDefault(c.ReapInterval, time.Second)
+	c.RetryInterval = orDefault(c.RetryInterval, 500*time.Millisecond)
+	c.DecisionTimeout = orDefault(c.DecisionTimeout, 1500*time.Millisecond)
+	c.DefaultTimeout = orDefault(c.DefaultTimeout, 5*time.Minute)
+	if c.MaxClaimBatch <= 0 {
+		c.MaxClaimBatch = 32
+	}
+	if c.LoopBatch <= 0 {
+		c.LoopBatch = 100
+	}
+	e := &Engine{
+		store: o.Store, log: o.Log, cfg: c, fence: o.Fence, policy: o.Policy,
+		retryPolicy: o.RetryPolicy, timeout: o.Timeout, rand: o.Rand, ready: newNotifier(),
+	}
+	if e.log == nil {
+		e.log = slog.New(slog.DiscardHandler)
+	}
+	if e.fence == nil {
+		e.fence = func() store.Fence { return store.Fence{} }
+	}
+	if e.policy == nil {
+		e.policy = decision.RulePolicy{}
+	}
+	if e.retryPolicy == nil {
+		e.retryPolicy = func(*state.Task) retry.Policy { return retry.DefaultPolicy() }
+	}
+	if e.timeout == nil {
+		e.timeout = func(*state.Task) time.Duration { return c.DefaultTimeout }
+	}
+	if e.rand == nil {
+		e.rand = rand.Float64
+	}
+	return e
+}
+
+// Config returns the effective configuration.
+func (e *Engine) Config() Config { return e.cfg }
+
+// Run executes the timer loops until ctx ends.
+func (e *Engine) Run(ctx context.Context) {
+	reap := time.NewTicker(e.cfg.ReapInterval)
+	defer reap.Stop()
+	retries := time.NewTicker(e.cfg.RetryInterval)
+	defer retries.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-reap.C:
+			if _, err := e.ReapExpired(ctx); err != nil && ctx.Err() == nil {
+				e.log.ErrorContext(ctx, "lease reaper", "err", err)
+			}
+		case <-retries.C:
+			if _, err := e.PromoteRetries(ctx); err != nil && ctx.Err() == nil {
+				e.log.ErrorContext(ctx, "retry timer", "err", err)
+			}
+		}
+	}
+}
+
+func orDefault(d, def time.Duration) time.Duration {
+	if d <= 0 {
+		return def
+	}
+	return d
+}
+
+// clean makes worker-supplied text storable: Postgres text and jsonb
+// reject NUL bytes and invalid UTF-8.
+func clean(s string) string {
+	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "�")
+}
+
+func digest(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}

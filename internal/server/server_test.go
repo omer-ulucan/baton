@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,7 +15,7 @@ func (f pingFunc) Ping(ctx context.Context) error { return f(ctx) }
 
 func newTestServer(t *testing.T, db Pinger) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(db, slog.New(slog.DiscardHandler)))
+	srv := httptest.NewServer(New(Deps{DB: db}))
 	t.Cleanup(srv.Close)
 	return srv
 }

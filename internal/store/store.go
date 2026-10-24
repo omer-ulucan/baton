@@ -33,48 +33,86 @@ type Fence struct {
 // must never do slow work such as inference (SPEC 10.2).
 type DecideFunc func(s *state.Snapshot, now time.Time) ([]state.Change, error)
 
-// Update runs one state change of one workflow (SPEC 5.1): it locks the
-// workflow, loads its snapshot, asks decide for changes, applies them,
-// appends the events and writes the touched projection rows, all in one
-// transaction. It returns the new snapshot and the appended events. If
-// decide returns no changes, nothing is written.
+// Tx is one database transaction of a writer. Lock order inside a Tx is
+// workflow, then task, then lease; any statement that would take them in
+// another order uses SKIP LOCKED so it never waits, which rules out
+// deadlocks between writers.
+type Tx struct {
+	tx    pgx.Tx
+	fence Fence
+	now   time.Time
+}
+
+// Now is the database clock at the start of the transaction. Every event
+// and lease decision in the transaction uses it.
+func (t *Tx) Now() time.Time { return t.now }
+
+// InTx runs fn in a transaction, committing if it returns nil.
+func (s *Store) InTx(ctx context.Context, fence Fence, fn func(*Tx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		t := &Tx{tx: tx, fence: fence}
+		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&t.now); err != nil {
+			return fmt.Errorf("read clock: %w", err)
+		}
+		t.now = t.now.UTC()
+		return fn(t)
+	})
+}
+
+// Load locks a workflow row and returns its snapshot. The lock serializes
+// every writer of this workflow (SPEC 5.1). A workflow that does not
+// exist yields an empty snapshot.
+func (t *Tx) Load(ctx context.Context, wfID uuid.UUID) (*state.Snapshot, error) {
+	return loadSnapshot(ctx, t.tx, wfID, true)
+}
+
+// Append applies changes to snap (which must come from Load in this
+// transaction), appends the events and writes the touched rows. On error
+// the caller must abandon the transaction.
+func (t *Tx) Append(ctx context.Context, snap *state.Snapshot, wfID uuid.UUID, changes []state.Change) ([]state.Event, error) {
+	if len(changes) == 0 {
+		return nil, nil
+	}
+	snap.ResetTouched()
+	seq := 0
+	if snap.Workflow != nil {
+		seq = snap.Workflow.LastSeq
+	}
+	events := make([]state.Event, len(changes))
+	for i, c := range changes {
+		events[i] = state.Event{WorkflowID: wfID, Seq: seq + i + 1, TaskID: c.TaskID, OccurredAt: t.now, Payload: c.Payload}
+		if err := state.Apply(snap, events[i]); err != nil {
+			return nil, err
+		}
+	}
+	if err := appendEvents(ctx, t.tx, t.fence, events); err != nil {
+		return nil, err
+	}
+	if err := writeProjection(ctx, t.tx, snap); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// Update runs one state change of one workflow (SPEC 5.1) in its own
+// transaction: Load, decide, Append. It returns the new snapshot and the
+// appended events; if decide returns no changes, nothing is written.
 func (s *Store) Update(ctx context.Context, fence Fence, wfID uuid.UUID, decide DecideFunc) (*state.Snapshot, []state.Event, error) {
 	var (
 		snap   *state.Snapshot
 		events []state.Event
 	)
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var now time.Time
-		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
-			return fmt.Errorf("read clock: %w", err)
-		}
+	err := s.InTx(ctx, fence, func(tx *Tx) error {
 		var err error
-		if snap, err = loadSnapshot(ctx, tx, wfID, true); err != nil {
+		if snap, err = tx.Load(ctx, wfID); err != nil {
 			return err
 		}
-		changes, err := decide(snap, now)
+		changes, err := decide(snap, tx.Now())
 		if err != nil {
 			return err
 		}
-		if len(changes) == 0 {
-			return nil
-		}
-		snap.ResetTouched()
-		seq := 0
-		if snap.Workflow != nil {
-			seq = snap.Workflow.LastSeq
-		}
-		events = make([]state.Event, len(changes))
-		for i, c := range changes {
-			events[i] = state.Event{WorkflowID: wfID, Seq: seq + i + 1, TaskID: c.TaskID, OccurredAt: now, Payload: c.Payload}
-			if err := state.Apply(snap, events[i]); err != nil {
-				return err
-			}
-		}
-		if err := appendEvents(ctx, tx, fence, events); err != nil {
-			return err
-		}
-		return writeProjection(ctx, tx, snap)
+		events, err = tx.Append(ctx, snap, wfID, changes)
+		return err
 	})
 	if err != nil {
 		return nil, nil, err
