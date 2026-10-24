@@ -1,0 +1,12 @@
+.git
+bin
+dist
+.cache
+models
+*.onnx
+*.onnx_data
+.env
+.env.*
+coverage.*
+.idea
+.vscode
