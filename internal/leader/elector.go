@@ -48,7 +48,7 @@ func New(s *store.Store, cfg Config, log *slog.Logger) *Elector {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Elector{
-		store: s, cfg: cfg, log: log.With("replica", cfg.ID),
+		store: s, cfg: cfg, log: log,
 		renewEvery: cfg.TTL / 3, stepDownAfter: cfg.TTL / 2,
 	}
 }
