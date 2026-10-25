@@ -19,9 +19,12 @@ which must replay deterministically.
   to `RulePolicy` on error, timeout, low confidence, or unavailability.
 - Inference never runs inside a database transaction, and never on the claim
   path, the reaper, the retry timer, or leader renewal. A semaphore bounds
-  concurrent ONNX runs; acquiring it honours the request deadline. Concurrent
-  requests are micro-batched (max 8, max wait 5ms). The session is loaded
-  once per process.
+  concurrent ONNX runs (default 2); a bounded queue (32) fails fast as
+  unavailable when full, and callers return at their deadline. The session
+  is loaded once per process. Micro-batching (up to N rows, 5ms window) is
+  supported but off by default: on CPU, with 8 concurrent callers, padded
+  batches of 8 gave 1.36 decisions/s against 1.89 for unbatched runs, two in
+  flight with half the cores each (docs/BENCHMARKS.md).
 - Every decision is recorded as a `DecisionMade` event in the transaction it
   drives, with input hash, label, confidence, policy, model revision,
   fallback reason and, on fallback, the primary's answer. Replay reads

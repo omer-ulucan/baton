@@ -819,8 +819,10 @@ Baton's questions:
 Runtime: `onnxruntime_go` v1.36.0 (cgo) with `libonnxruntime.so` 1.29.0,
 its target C API, installed from Microsoft's release with a checksum; one
 session per process, created lazily at startup in the background; the model
-files are re-verified by SHA-256 on every load; requests are micro-batched (max batch 8, max wait 5ms, padded
-to the longest sequence in the batch). If loading fails (missing or corrupt
+files are re-verified by SHA-256 on every load; two runs may be in flight, each with half the CPU threads, and
+further requests wait in a bounded queue (32; full means `unavailable`).
+Micro-batching (padded to the longest row, 5ms window) is available but off
+by default, because on CPU it measured slower than unbatched runs. If loading fails (missing or corrupt
 model, checksum mismatch, missing library) the policy reports `unavailable`
 and every decision falls back; the orchestrator keeps running and exposes
 `baton_decision_model_loaded 0`.
