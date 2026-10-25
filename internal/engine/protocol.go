@@ -157,7 +157,7 @@ func (e *Engine) claimOnce(ctx context.Context, req ClaimRequest) ([]Assignment,
 				return err
 			}
 			t := snap.Tasks[ref.TaskID]
-			def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+			def, err := e.defs.get(ctx, tx, snap.Workflow.DefinitionID)
 			if err != nil {
 				return err
 			}
@@ -358,7 +358,7 @@ func (e *Engine) Fail(ctx context.Context, r Result, f Failure) (Next, error) {
 			return err
 		}
 		t := snap.Tasks[r.TaskID]
-		def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+		def, err := e.defs.get(ctx, tx, snap.Workflow.DefinitionID)
 		if err != nil {
 			return err
 		}
