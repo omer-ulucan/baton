@@ -243,8 +243,8 @@ func isUniqueViolation(err error) bool {
 // so their next heartbeat stops them. With compensate, completed steps are
 // compensated first (SPEC 3.3).
 func (e *Engine) Cancel(ctx context.Context, wfID uuid.UUID, compensate bool, reason string) error {
-	return e.updateWorkflow(ctx, wfID, func(snap *state.Snapshot) ([]state.Change, error) {
-		def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+	return e.updateWorkflow(ctx, wfID, func(tx *store.Tx, snap *state.Snapshot) ([]state.Change, error) {
+		def, err := e.defs.get(ctx, tx, snap.Workflow.DefinitionID)
 		if err != nil {
 			return nil, err
 		}
@@ -264,7 +264,7 @@ func (e *Engine) Cancel(ctx context.Context, wfID uuid.UUID, compensate bool, re
 
 // Pause stops new claims of a workflow's tasks; running attempts finish.
 func (e *Engine) Pause(ctx context.Context, wfID uuid.UUID) error {
-	return e.updateWorkflow(ctx, wfID, func(*state.Snapshot) ([]state.Change, error) {
+	return e.updateWorkflow(ctx, wfID, func(*store.Tx, *state.Snapshot) ([]state.Change, error) {
 		return []state.Change{{Payload: state.WorkflowPaused{}}}, nil
 	})
 }
@@ -273,7 +273,7 @@ func (e *Engine) Pause(ctx context.Context, wfID uuid.UUID) error {
 // finished while it was paused become ready at once; retries whose time
 // passed are picked up by the retry timer.
 func (e *Engine) Resume(ctx context.Context, wfID uuid.UUID) error {
-	return e.updateWorkflow(ctx, wfID, func(*state.Snapshot) ([]state.Change, error) {
+	return e.updateWorkflow(ctx, wfID, func(*store.Tx, *state.Snapshot) ([]state.Change, error) {
 		return []state.Change{{Payload: state.WorkflowResumed{}}}, nil
 	})
 }
@@ -285,7 +285,7 @@ func (e *Engine) RetryDLQ(ctx context.Context, taskID uuid.UUID, by string) erro
 	if err != nil {
 		return err
 	}
-	return e.updateWorkflow(ctx, wf, func(snap *state.Snapshot) ([]state.Change, error) {
+	return e.updateWorkflow(ctx, wf, func(_ *store.Tx, snap *state.Snapshot) ([]state.Change, error) {
 		t := snap.Tasks[taskID]
 		if t.Status != state.TsDeadLettered {
 			return nil, fmt.Errorf("%w: task is %s, not dead_lettered", ErrInvalid, t.Status)
@@ -299,7 +299,7 @@ func (e *Engine) RetryDLQ(ctx context.Context, taskID uuid.UUID, by string) erro
 	})
 }
 
-func (e *Engine) updateWorkflow(ctx context.Context, wfID uuid.UUID, decide func(*state.Snapshot) ([]state.Change, error)) error {
+func (e *Engine) updateWorkflow(ctx context.Context, wfID uuid.UUID, decide func(*store.Tx, *state.Snapshot) ([]state.Change, error)) error {
 	return e.inTx(ctx, func(tx *store.Tx) error {
 		snap, err := tx.Load(ctx, wfID)
 		if err != nil {
@@ -308,7 +308,7 @@ func (e *Engine) updateWorkflow(ctx context.Context, wfID uuid.UUID, decide func
 		if snap.Workflow == nil {
 			return ErrWorkflowNotFound
 		}
-		changes, err := decide(snap)
+		changes, err := decide(tx, snap)
 		if err != nil {
 			return err
 		}

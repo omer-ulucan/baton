@@ -36,7 +36,7 @@ func (e *Engine) ReapExpired(ctx context.Context) (int, error) {
 				}
 				continue
 			}
-			def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+			def, err := e.defs.get(ctx, tx, snap.Workflow.DefinitionID)
 			if err != nil {
 				return err
 			}

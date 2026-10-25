@@ -127,7 +127,7 @@ func New(o Options) *Engine {
 	e := &Engine{
 		store: o.Store, log: o.Log, cfg: c, fence: o.Fence, policy: o.Policy,
 		retryPolicy: o.RetryPolicy, timeout: o.Timeout, rand: o.Rand, ready: newNotifier(),
-		defs:        &definitions{store: o.Store, byID: map[uuid.UUID]*workflow.Definition{}},
+		defs:        &definitions{byID: map[uuid.UUID]*workflow.Definition{}},
 		escalateURL: o.EscalationURL, http: o.HTTPClient, onFenced: o.OnFenced,
 		obs: o.Observer, tracer: o.Tracer,
 	}

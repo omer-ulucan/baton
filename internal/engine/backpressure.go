@@ -85,7 +85,7 @@ func (e *Engine) AdmitDeferred(ctx context.Context) (int, error) {
 			if err != nil {
 				return err
 			}
-			def, err := e.defs.get(ctx, snap.Workflow.DefinitionID)
+			def, err := e.defs.get(ctx, tx, snap.Workflow.DefinitionID)
 			if err != nil {
 				return err
 			}
