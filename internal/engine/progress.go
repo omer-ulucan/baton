@@ -182,20 +182,20 @@ func (sb *sandbox) addAll(cs []state.Change) {
 }
 
 // definitions caches parsed definitions; they are immutable once stored.
+// Misses are read through the caller's transaction (see Tx.Definition).
 type definitions struct {
-	store *store.Store
-	mu    sync.Mutex
-	byID  map[uuid.UUID]*workflow.Definition
+	mu   sync.Mutex
+	byID map[uuid.UUID]*workflow.Definition
 }
 
-func (d *definitions) get(ctx context.Context, id uuid.UUID) (*workflow.Definition, error) {
+func (d *definitions) get(ctx context.Context, tx *store.Tx, id uuid.UUID) (*workflow.Definition, error) {
 	d.mu.Lock()
 	def, ok := d.byID[id]
 	d.mu.Unlock()
 	if ok {
 		return def, nil
 	}
-	spec, err := d.store.Definition(ctx, id)
+	spec, err := tx.Definition(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +227,7 @@ func (e *Engine) commit(ctx context.Context, tx *store.Tx, snap *state.Snapshot,
 	if sb.err != nil {
 		return sb.err
 	}
-	def, err := e.defs.get(ctx, sb.s.Workflow.DefinitionID)
+	def, err := e.defs.get(ctx, tx, sb.s.Workflow.DefinitionID)
 	if err != nil {
 		return err
 	}

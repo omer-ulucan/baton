@@ -41,10 +41,13 @@ func (t *Tx) InsertDefinition(ctx context.Context, name string, version int, sha
 	return got, nil
 }
 
-// Definition returns a stored definition's spec.
-func (s *Store) Definition(ctx context.Context, id uuid.UUID) ([]byte, error) {
+// Definition returns a stored definition's spec, read in the transaction.
+// Code holding a transaction must never take a second connection from the
+// pool: with the pool exhausted by transactions waiting on locks the
+// holder has, that wait never ends and Postgres cannot see it as a deadlock.
+func (t *Tx) Definition(ctx context.Context, id uuid.UUID) ([]byte, error) {
 	var spec []byte
-	if err := s.pool.QueryRow(ctx, `SELECT spec FROM workflow_definitions WHERE id = $1`, id).Scan(&spec); err != nil {
+	if err := t.tx.QueryRow(ctx, `SELECT spec FROM workflow_definitions WHERE id = $1`, id).Scan(&spec); err != nil {
 		return nil, fmt.Errorf("definition %s: %w", id, err)
 	}
 	return spec, nil

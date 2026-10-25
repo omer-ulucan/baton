@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,8 +10,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/omer-ulucan/baton/internal/engine"
+	"github.com/omer-ulucan/baton/internal/pgtest"
 	"github.com/omer-ulucan/baton/internal/state"
 	"github.com/omer-ulucan/baton/internal/store"
 )
@@ -173,5 +176,57 @@ func TestSetQueueValidation(t *testing.T) {
 		if err := e.eng.SetQueue(t.Context(), c); !errors.Is(err, engine.ErrInvalid) {
 			t.Errorf("%+v accepted: %v", c, err)
 		}
+	}
+}
+
+// TestSmallPoolCannotDeadlock reproduces a hang first seen on a 4-CPU CI
+// runner (pool of 4): a claim holding a queue's advisory lock fetched a
+// definition through the pool while every other connection belonged to a
+// claim waiting for that lock. Postgres cannot see that cycle. With two
+// connections, ten racing claimers and a cold definition cache, claims
+// must still finish.
+func TestSmallPoolCannotDeadlock(t *testing.T) {
+	_, url := pg.NewDB(t)
+	pool, err := pgxpool.New(t.Context(), url+"&pool_max_conns=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(t.Context(), `INSERT INTO workflow_definitions (id, name, version, sha256, spec, created_at)
+		VALUES ($1, 'test', 1, '\x01', '{}', now())`, defID); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(pool)
+	fence := pgtest.Lead(t, pool)
+	e := &env{fence: fence, t: t, pool: pool, store: s, eng: engine.New(engine.Options{
+		Store: s, Fence: func() store.Fence { return fence }, RetryPolicy: fastRetry,
+		Config: engine.Config{ClaimPoll: 20 * time.Millisecond},
+	})}
+	e.setQueue(store.QueueConfig{Queue: "q", MaxConcurrency: ip(3)})
+	e.seed(20, "q", "h", 3)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	var claimed atomic.Int64
+	for w := range 10 {
+		id := fmt.Sprintf("w%d", w)
+		e.register(id, []string{"q"}, []string{"h"})
+		wg.Go(func() {
+			for ctx.Err() == nil && claimed.Load() < 20 {
+				got, err := e.eng.Claim(ctx, engine.ClaimRequest{WorkerID: id, Max: 2})
+				if err != nil {
+					return
+				}
+				for _, a := range got {
+					if e.eng.Complete(ctx, res(a, id), nil) == nil {
+						claimed.Add(1)
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		t.Fatalf("hung with a 2-connection pool: %d of 20 tasks done", claimed.Load())
 	}
 }
