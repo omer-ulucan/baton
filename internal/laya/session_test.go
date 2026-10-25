@@ -44,7 +44,8 @@ func loadModel(t testing.TB) *Model {
 	}
 	lib := libPath(t)
 	sharedOnce.Do(func() {
-		shared, sharedErr = Load(SessionConfig{LibPath: lib, ModelDir: dir, Variant: model.FP32})
+		// Batching on, so the parity and batching tests exercise padding.
+		shared, sharedErr = Load(SessionConfig{LibPath: lib, ModelDir: dir, Variant: model.FP32, MaxBatch: 8})
 	})
 	if sharedErr != nil {
 		t.Fatal(sharedErr)

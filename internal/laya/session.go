@@ -26,9 +26,12 @@ type SessionConfig struct {
 	Variant  model.Variant
 	// IntraOpThreads per run; 0 picks half the CPUs (two runs in flight).
 	IntraOpThreads int
-	MaxBatch       int           // rows per run, default 8
-	MaxWait        time.Duration // batching window, default 5ms
-	MaxInflight    int           // concurrent runs, default 2
+	// MaxBatch is rows per run. Default 1: on CPU, padded batches measured
+	// slower than the same rows run one by one (docs/BENCHMARKS.md).
+	MaxBatch    int
+	MaxWait     time.Duration // batching window, default 5ms
+	MaxInflight int           // concurrent runs, default 2
+	MaxQueue    int           // rows waiting for a run before ErrOverloaded, default 32
 	// SkipVerify skips hashing the weights at load (tests that just did).
 	SkipVerify bool
 }
@@ -133,13 +136,13 @@ func Load(c SessionConfig) (*Model, error) {
 	}
 	m := &Model{
 		tok: tok, specials: sp, cfg: cfg, session: sess, revision: model.RevisionLabel(c.Variant),
-		batch: orInt(c.MaxBatch, 8), maxWait: c.MaxWait, stop: make(chan struct{}),
+		batch: orInt(c.MaxBatch, 1), maxWait: c.MaxWait, stop: make(chan struct{}),
 		sem: make(chan struct{}, orInt(c.MaxInflight, 2)),
 	}
 	if m.maxWait <= 0 {
 		m.maxWait = 5 * time.Millisecond
 	}
-	m.queue = make(chan *request, m.batch*cap(m.sem)*2)
+	m.queue = make(chan *request, orInt(c.MaxQueue, 32))
 	m.wg.Go(m.batcher)
 	return m, nil
 }

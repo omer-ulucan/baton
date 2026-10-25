@@ -80,17 +80,26 @@ func (s *Server) NewDB(t *testing.T) (*pgxpool.Pool, string) {
 		t.Skip("integration test: Postgres not available (-short)")
 	}
 	ctx := t.Context()
-	name := fmt.Sprintf("t%d", s.n.Add(1))
-	if err := s.exec(ctx, fmt.Sprintf("CREATE DATABASE %s TEMPLATE %s", name, template)); err != nil {
+	dbURL, err := s.NewDatabase(ctx)
+	if err != nil {
 		t.Fatalf("create test database: %v", err)
 	}
-	dbURL := s.url(name)
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	return pool, dbURL
+}
+
+// NewDatabase creates a fresh, migrated database and returns its URL (for
+// tools outside go test, such as the benchmark).
+func (s *Server) NewDatabase(ctx context.Context) (string, error) {
+	name := fmt.Sprintf("t%d", s.n.Add(1))
+	if err := s.exec(ctx, fmt.Sprintf("CREATE DATABASE %s TEMPLATE %s", name, template)); err != nil {
+		return "", err
+	}
+	return s.url(name), nil
 }
 
 func (s *Server) url(db string) string {
